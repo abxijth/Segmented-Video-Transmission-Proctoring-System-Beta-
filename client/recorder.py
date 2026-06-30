@@ -54,20 +54,28 @@ class ChunkRecorder:
     # --- capture loop -------------------------------------------------------
     def _run(self) -> None:
         width, height = self._camera.actual_resolution
-        frame_interval = 1.0 / self._config.fps
 
         while not self._stop.is_set():
             sequence = self._next_sequence
-            self._record_one_chunk(sequence, width, height, frame_interval)
+            self._record_one_chunk(sequence, width, height)
             self._next_sequence += 1
 
-    def _record_one_chunk(self, sequence: int, width: int, height: int,
-                          frame_interval: float) -> None:
+    def _record_one_chunk(self, sequence: int, width: int, height: int) -> None:
+        """Record one chunk at a constant, wall-clock-accurate frame rate.
+
+        Real-time correctness: a chunk is tagged at `config.fps`, so to play
+        back at normal speed it must contain exactly `fps * chunk_seconds`
+        frames. Webcams rarely deliver frames at a perfectly steady rate, so we
+        pace by the wall clock — at any moment we have written
+        `floor(elapsed * fps)` frames, duplicating the most recent frame when
+        the camera is running behind. This keeps playback duration equal to
+        real elapsed time instead of speeding it up.
+        """
         final_path = self._queue.path_for(sequence)
         part_path = self._queue.staging_path_for(sequence)
+        fps = self._config.fps
 
-        writer = cv2.VideoWriter(part_path, self._fourcc,
-                                 self._config.fps, (width, height))
+        writer = cv2.VideoWriter(part_path, self._fourcc, fps, (width, height))
         if not writer.isOpened():
             raise RuntimeError(
                 f"VideoWriter could not open {part_path!r} with fourcc "
@@ -75,16 +83,27 @@ class ChunkRecorder:
                 f"support this codec — try 'mp4v' (default) or 'avc1' in "
                 f"client/config.py.")
 
-        deadline = time.monotonic() + self._config.chunk_seconds
+        target_total = int(round(self._config.chunk_seconds * fps))
+        start = time.monotonic()
         frames_written = 0
+        latest_frame = None
         try:
-            while time.monotonic() < deadline and not self._stop.is_set():
+            while frames_written < target_total and not self._stop.is_set():
                 frame = self._camera.read_frame()
-                if frame is None:
-                    continue  # transient camera glitch; keep trying
-                writer.write(frame)
-                frames_written += 1
-                time.sleep(frame_interval)
+                if frame is not None:
+                    latest_frame = frame
+                if latest_frame is None:
+                    continue  # no frame yet; wait for the first one
+
+                # Catch up to where the wall clock says we should be, capped at
+                # this chunk's total so we never overrun into the next second.
+                elapsed = time.monotonic() - start
+                due = min(int(elapsed * fps), target_total)
+                while frames_written < due:
+                    writer.write(latest_frame)
+                    frames_written += 1
+
+                time.sleep(0.002)  # yield; avoids a busy-spin between frames
         finally:
             writer.release()
 

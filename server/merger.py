@@ -4,10 +4,11 @@ Uses ffmpeg's concat demuxer with stream copy (`-c copy`): no re-encoding, so
 it is fast and lossless. The server never decodes H.264 during normal
 operation, exactly as the roadmap specifies — it just stitches containers.
 
-Strategy (prototype): rebuild recording.mp4 from the contiguous run of chunks
-0..N each time. Rebuilding is idempotent and robust; an incremental append is
-a later optimization. Original chunks are kept until you choose to archive
-them.
+Strategy: **incremental append.** Each merge concatenates the existing
+recording.mp4 (if any) with the next contiguous batch of chunks and replaces
+recording.mp4. The merged chunks are then safe to delete, which keeps disk
+usage bounded during long exams (unlike a full rebuild, which needs every
+chunk to remain on disk forever).
 """
 
 from __future__ import annotations
@@ -23,31 +24,35 @@ class MergeError(RuntimeError):
     pass
 
 
-def merge_recording(store: SessionStore) -> int:
-    """(Re)build recording.mp4 from contiguous chunks.
+def append_to_recording(store: SessionStore, sequences: list[int]) -> None:
+    """Append `sequences` (in order) to recording.mp4, creating it if needed.
 
-    Returns the highest sequence number now included (-1 if nothing to merge).
+    Caller must hold the session lock and pass a contiguous, in-order batch
+    that immediately follows whatever is already in recording.mp4.
     """
-    sequences = store.contiguous_sequences()
     if not sequences:
-        return -1
+        return
 
-    concat_list = _write_concat_list(store, sequences)
+    inputs: list[str] = []
+    if store.recording_exists():
+        # Put the current recording first so the new chunks extend it.
+        inputs.append(store.recording_path)
+    inputs.extend(store.chunk_path(seq) for seq in sequences)
+
+    concat_list = _write_concat_list(inputs)
     try:
         _run_ffmpeg_concat(concat_list, store.recording_path)
     finally:
         os.remove(concat_list)
 
-    return sequences[-1]
 
-
-def _write_concat_list(store: SessionStore, sequences: list[int]) -> str:
+def _write_concat_list(input_paths: list[str]) -> str:
     """Write the ffmpeg concat demuxer input file, return its path."""
     fd, path = tempfile.mkstemp(suffix=".txt")
     with os.fdopen(fd, "w") as fh:
-        for seq in sequences:
+        for input_path in input_paths:
             # ffmpeg concat needs absolute, single-quote-escaped paths.
-            abs_path = os.path.abspath(store.chunk_path(seq))
+            abs_path = os.path.abspath(input_path)
             safe = abs_path.replace("'", "'\\''")
             fh.write(f"file '{safe}'\n")
     return path
@@ -55,7 +60,7 @@ def _write_concat_list(store: SessionStore, sequences: list[int]) -> str:
 
 def _run_ffmpeg_concat(concat_list: str, output_path: str) -> None:
     # Write to a temp file in the same dir, then rename, so a reader never sees
-    # a half-rebuilt recording.mp4.
+    # a half-built recording.mp4 (and so an input == output is never clobbered).
     tmp_out = output_path + ".building.mp4"
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",

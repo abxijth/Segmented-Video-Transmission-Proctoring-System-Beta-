@@ -73,20 +73,31 @@ class SessionStore:
         seqs.sort()
         return seqs
 
-    def contiguous_sequences(self) -> list[int]:
-        """The longest run 0,1,2,... with no gaps. This is what is safe to
-        merge into recording.mp4."""
+    def contiguous_after(self, last_merged: int) -> list[int]:
+        """Stored chunks forming an unbroken run starting at last_merged + 1.
+
+        Chunks already folded into recording.mp4 are deleted, so the merge
+        worker only ever needs the next contiguous batch. If the chunk right
+        after last_merged is missing (a gap not yet filled), returns [].
+        """
+        stored = set(self.stored_sequences())
         run: list[int] = []
-        expected = 0
-        for seq in self.stored_sequences():
-            if seq == expected:
-                run.append(seq)
-                expected += 1
-            elif seq < expected:
-                continue  # duplicate
-            else:
-                break     # gap; stop here
+        seq = last_merged + 1
+        while seq in stored:
+            run.append(seq)
+            seq += 1
         return run
+
+    def delete_chunks(self, sequences: list[int]) -> None:
+        """Remove chunk files after they have been merged into recording.mp4."""
+        for seq in sequences:
+            try:
+                os.remove(self.chunk_path(seq))
+            except FileNotFoundError:
+                pass
+
+    def recording_exists(self) -> bool:
+        return os.path.exists(self.recording_path)
 
     # --- metadata -----------------------------------------------------------
     def load_metadata(self) -> dict | None:

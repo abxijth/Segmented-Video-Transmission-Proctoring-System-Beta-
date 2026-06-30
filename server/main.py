@@ -1,12 +1,17 @@
-"""FastAPI server — receive chunks, store them, merge into recording.mp4.
+"""FastAPI server — receive chunks; a background worker merges & cleans up.
 
 Endpoints:
     POST /exams/{exam}/{student}/chunks          upload one chunk
-    POST /exams/{exam}/{student}/finalize        mark recording complete
+    POST /exams/{exam}/{student}/finalize        flush + mark complete
     GET  /exams/{exam}/{student}/status          metadata + counts
     GET  /exams/{exam}/{student}/recording.mp4   download merged recording
     GET  /exams                                  list all sessions
     GET  /health
+
+Uploads just store the chunk and return fast. The MergeWorker
+(see server/worker.py) merges chunks into recording.mp4, deletes the merged
+chunks, and auto-finalizes sessions whose client has disconnected — so the
+server reaches a complete recording even if the client never finalizes.
 
 Run:
     python -m server.main
@@ -14,38 +19,38 @@ Run:
 
 from __future__ import annotations
 
-import threading
-from collections import defaultdict
+import time
+from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import (
-    Depends,
-    FastAPI,
-    Header,
-    HTTPException,
-    Path,
-    UploadFile,
-    File,
-)
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Path, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from server.config import ServerConfig
-from server.merger import MergeError, merge_recording
+from server.locks import session_lock
 from server.storage import SessionStore, list_sessions
+from server.worker import MergeWorker, finalize_session
 from shared.protocol import (
     AUTH_SCHEME,
     HEADER_SEQUENCE,
-    STATUS_FINALIZED,
+    STATUS_RECORDING,
     UPLOAD_FILE_FIELD,
 )
 
 config = ServerConfig()
-app = FastAPI(title="SEB Proctoring Server", version="0.1")
+worker = MergeWorker(config)
 
-# One lock per (exam, student) so chunk-store + merge for a session is
-# serialized, while different students upload fully in parallel.
-_session_locks: defaultdict[tuple[str, str], threading.Lock] = defaultdict(
-    threading.Lock)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    worker.start()
+    try:
+        yield
+    finally:
+        worker.stop()
+
+
+app = FastAPI(title="SEB Proctoring Server", version="0.2", lifespan=lifespan)
 
 
 # --- auth -------------------------------------------------------------------
@@ -60,9 +65,11 @@ def _store(exam_id: str, student_id: str) -> SessionStore:
 
 
 # --- upload -----------------------------------------------------------------
+# Sync handler: FastAPI runs it in a threadpool, so the blocking disk write and
+# the brief lock wait never stall the event loop or other students' uploads.
 @app.post("/exams/{exam_id}/{student_id}/chunks",
           dependencies=[Depends(require_auth)])
-async def upload_chunk(
+def upload_chunk(
     exam_id: str = Path(...),
     student_id: str = Path(...),
     chunk: UploadFile = File(..., alias=UPLOAD_FILE_FIELD),
@@ -71,40 +78,31 @@ async def upload_chunk(
     if x_chunk_sequence < 0:
         raise HTTPException(status_code=400, detail="sequence must be >= 0")
 
-    data = await chunk.read()
+    data = chunk.file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty chunk")
 
     store = _store(exam_id, student_id)
 
-    # Serialize per session: store the chunk, then re-merge the contiguous run.
-    with _session_locks[(exam_id, student_id)]:
-        if store.has_chunk(x_chunk_sequence):
-            # Idempotent retry — already have it. 409 tells the client to drop
-            # its local copy without resending.
+    with session_lock(exam_id, student_id):
+        meta = store.init_metadata_if_absent(
+            codec="H264", resolution="unknown", fps=0)
+
+        # Already merged (and deleted), or still pending: idempotent retry.
+        # 409 tells the client to drop its local copy without resending.
+        if x_chunk_sequence <= meta["lastMerged"] or \
+                store.has_chunk(x_chunk_sequence):
             return JSONResponse(status_code=409,
                                 content={"status": "duplicate",
                                          "sequence": x_chunk_sequence})
 
         store.save_chunk(x_chunk_sequence, data)
-
-        meta = store.init_metadata_if_absent(
-            codec="H264", resolution="unknown", fps=0)
-        stored = store.stored_sequences()
-        meta["lastReceived"] = stored[-1] if stored else -1
-
-        try:
-            last_merged = merge_recording(store)
-        except MergeError as exc:
-            raise HTTPException(status_code=500,
-                                detail=f"merge failed: {exc}")
-
-        meta["lastMerged"] = last_merged
-        meta["expectedChunk"] = last_merged + 1
+        meta["lastReceived"] = max(meta["lastReceived"], x_chunk_sequence)
+        meta["lastChunkAt"] = time.time()
+        meta["status"] = STATUS_RECORDING  # (re)activate; worker may finalize
         store.save_metadata(meta)
 
-    return {"status": "stored", "sequence": x_chunk_sequence,
-            "lastMerged": last_merged}
+    return {"status": "stored", "sequence": x_chunk_sequence}
 
 
 # --- finalize ---------------------------------------------------------------
@@ -112,21 +110,13 @@ async def upload_chunk(
           dependencies=[Depends(require_auth)])
 def finalize(exam_id: str, student_id: str):
     store = _store(exam_id, student_id)
-    meta = store.load_metadata()
-    if meta is None:
+    if store.load_metadata() is None:
         raise HTTPException(status_code=404, detail="no such session")
 
-    with _session_locks[(exam_id, student_id)]:
-        try:
-            last_merged = merge_recording(store)
-        except MergeError as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
-        meta["lastMerged"] = last_merged
-        meta["expectedChunk"] = last_merged + 1
-        meta["status"] = STATUS_FINALIZED
-        store.save_metadata(meta)
+    with session_lock(exam_id, student_id):
+        meta = finalize_session(store)
 
-    return {"status": STATUS_FINALIZED, "lastMerged": last_merged}
+    return {"status": meta["status"], "lastMerged": meta["lastMerged"]}
 
 
 # --- read endpoints ---------------------------------------------------------
@@ -136,19 +126,17 @@ def status(exam_id: str, student_id: str):
     meta = store.load_metadata()
     if meta is None:
         raise HTTPException(status_code=404, detail="no such session")
-    stored = store.stored_sequences()
     return {
         **meta,
-        "storedChunks": len(stored),
-        "contiguousChunks": len(store.contiguous_sequences()),
-        "hasRecording": _recording_exists(store),
+        "pendingChunks": len(store.stored_sequences()),  # not yet merged
+        "hasRecording": store.recording_exists(),
     }
 
 
 @app.get("/exams/{exam_id}/{student_id}/recording.mp4")
 def download_recording(exam_id: str, student_id: str):
     store = _store(exam_id, student_id)
-    if not _recording_exists(store):
+    if not store.recording_exists():
         raise HTTPException(status_code=404, detail="recording not ready")
     return FileResponse(store.recording_path, media_type="video/mp4",
                         filename=f"{exam_id}_{student_id}.mp4")
@@ -167,11 +155,6 @@ def all_sessions():
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-def _recording_exists(store: SessionStore) -> bool:
-    import os
-    return os.path.exists(store.recording_path)
 
 
 def main() -> None:

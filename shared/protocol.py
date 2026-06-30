@@ -55,6 +55,7 @@ def new_metadata(student_id: str, exam_id: str, codec: str,
         "expectedChunk": 0,    # next contiguous sequence the server wants
         "lastReceived": -1,    # highest sequence stored (may be ahead of merge)
         "lastMerged": -1,      # highest sequence folded into recording.mp4
+        "lastChunkAt": 0.0,    # epoch seconds of the last upload (staleness)
         "status": STATUS_RECORDING,
         "codec": codec,
         "resolution": resolution,
