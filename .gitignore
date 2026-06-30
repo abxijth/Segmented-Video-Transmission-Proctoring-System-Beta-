@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime data (generated)
+storage/
+client_queue/
+*.mp4
+*.log
