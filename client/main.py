@@ -25,7 +25,7 @@ import sys
 import time
 
 from client.camera import CameraManager
-from client.config import ClientConfig
+from client.config import DEFAULT_SERVER_URL, ClientConfig
 from client.disk_queue import DiskQueue
 from client.recorder import ChunkRecorder
 from client.uploader import UploadManager
@@ -82,9 +82,10 @@ def resolve_config(argv: list[str] | None = None) -> ClientConfig:
     exam = pick(args.exam, "PROCTOR_EXAM", "exam")
     student = pick(args.student, "PROCTOR_STUDENT", "student")
 
-    # Fall back to interactive prompts for anything still missing (double-click).
+    # Server has a baked-in default (see client/config.py), so it never needs a
+    # prompt. Exam/student fall back to prompts only if still unset.
     if not server:
-        server = _prompt("Server URL", "http://127.0.0.1:8000")
+        server = DEFAULT_SERVER_URL
     if not exam:
         exam = _prompt("Exam ID", "exam2026")
     if not student:

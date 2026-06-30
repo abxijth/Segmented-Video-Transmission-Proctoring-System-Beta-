@@ -11,13 +11,19 @@ from dataclasses import dataclass
 
 from shared.protocol import DEFAULT_AUTH_TOKEN
 
+# Baked-in default server. Change this one line and rebuild to ship an exe that
+# already points at your machine — no flags, env, or proctor.ini needed.
+# Can still be overridden at runtime (CLI > env PROCTOR_SERVER > proctor.ini).
+DEFAULT_SERVER_URL = os.environ.get(
+    "PROCTOR_SERVER", "http://10.47.244.1:8000")
+
 
 @dataclass
 class ClientConfig:
     # --- Session identity ---
-    server_url: str                 # e.g. "http://192.168.1.50:8000"
-    exam_id: str
-    student_id: str
+    server_url: str = DEFAULT_SERVER_URL   # e.g. "http://192.168.1.50:8000"
+    exam_id: str = "exam2026"
+    student_id: str = "student001"
     auth_token: str = os.environ.get("PROCTOR_TOKEN", DEFAULT_AUTH_TOKEN)
 
     # --- Camera ---
