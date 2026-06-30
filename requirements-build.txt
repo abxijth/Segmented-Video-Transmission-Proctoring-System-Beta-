@@ -1,0 +1,5 @@
+# Build-time deps for packaging the client into a standalone executable.
+# Install these (plus the client runtime deps) before running PyInstaller.
+opencv-python>=4.8
+requests>=2.31
+pyinstaller>=6.3

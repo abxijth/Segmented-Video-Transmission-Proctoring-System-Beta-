@@ -2,7 +2,15 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-build/
 venv/
+
+# PyInstaller build output (the .spec IS tracked; build/ and dist/ are not)
+build/proctor-client/
+dist/
+
+# Local machine config (ship proctor.ini.example, not the filled-in one)
+proctor.ini
 
 # Runtime data (generated)
 storage/

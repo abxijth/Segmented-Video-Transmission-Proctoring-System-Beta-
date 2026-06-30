@@ -1,0 +1,45 @@
+name: Build Proctor Client
+
+# Builds standalone executables for Windows, Linux, and macOS from the same
+# spec. PyInstaller can't cross-compile, so each OS is built on its own runner.
+# Download the results from the workflow run's "Artifacts" section.
+
+on:
+  workflow_dispatch:        # run manually from the Actions tab
+  push:
+    tags:
+      - "v*"                # ...or on a version tag
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: ProctorClient-windows
+          - os: ubuntu-latest
+            artifact: ProctorClient-linux
+          - os: macos-latest
+            artifact: ProctorClient-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Build executable
+        run: pyinstaller --clean --noconfirm proctor-client.spec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
