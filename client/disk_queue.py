@@ -23,6 +23,16 @@ class DiskQueue:
     def path_for(self, sequence: int) -> str:
         return os.path.join(self._dir, chunk_filename(sequence))
 
+    def staging_path_for(self, sequence: int) -> str:
+        """Path the recorder writes to while a chunk is still in progress.
+
+        It ends in `.mp4` so OpenCV's VideoWriter picks the MP4 container, but
+        the leading dot means it does NOT start with `chunk_`, so `pending()`
+        skips it and the uploader never grabs a half-written file. On
+        completion the recorder renames it to `path_for(sequence)`.
+        """
+        return os.path.join(self._dir, "." + chunk_filename(sequence))
+
     def pending(self) -> list[tuple[int, str]]:
         """All queued chunks as (sequence, path), oldest sequence first.
 

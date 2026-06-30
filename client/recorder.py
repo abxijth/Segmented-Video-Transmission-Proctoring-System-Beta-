@@ -4,9 +4,10 @@ Runs in its own thread. Every `chunk_seconds` it closes the current MP4 and
 opens the next one, so the disk queue fills with independently-playable
 ~5-second clips numbered in sequence.
 
-Write-then-rename: each chunk is written to `<name>.part` and renamed to its
-final `chunk_NNNNNN.mp4` only when complete, so the uploader can never pick up
-a half-written file.
+Write-then-rename: each chunk is written to a staging name (`.chunk_NNNNNN.mp4`)
+and renamed to its final `chunk_NNNNNN.mp4` only when complete, so the uploader
+can never pick up a half-written file. The staging name still ends in `.mp4` so
+OpenCV's VideoWriter selects the MP4 container correctly.
 """
 
 from __future__ import annotations
@@ -63,14 +64,16 @@ class ChunkRecorder:
     def _record_one_chunk(self, sequence: int, width: int, height: int,
                           frame_interval: float) -> None:
         final_path = self._queue.path_for(sequence)
-        part_path = final_path + ".part"
+        part_path = self._queue.staging_path_for(sequence)
 
         writer = cv2.VideoWriter(part_path, self._fourcc,
                                  self._config.fps, (width, height))
         if not writer.isOpened():
             raise RuntimeError(
-                f"VideoWriter failed for fourcc {self._config.chunk_fourcc!r}; "
-                f"try 'mp4v' in client/config.py")
+                f"VideoWriter could not open {part_path!r} with fourcc "
+                f"{self._config.chunk_fourcc!r}. Your OpenCV build may not "
+                f"support this codec — try 'mp4v' (default) or 'avc1' in "
+                f"client/config.py.")
 
         deadline = time.monotonic() + self._config.chunk_seconds
         frames_written = 0
