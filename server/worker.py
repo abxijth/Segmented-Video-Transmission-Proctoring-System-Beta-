@@ -22,7 +22,7 @@ import time
 
 from server.config import ServerConfig
 from server.locks import session_lock
-from server.merger import append_to_recording
+from server.merger import append_chunks_to_ts
 from server.storage import SessionStore, list_sessions
 from shared.protocol import STATUS_FINALIZED, STATUS_RECORDING
 
@@ -39,7 +39,7 @@ def merge_pending(store: SessionStore) -> dict | None:
 
     batch = store.contiguous_after(meta.get("lastMerged", -1))
     if batch:
-        append_to_recording(store, batch)
+        append_chunks_to_ts(store, batch)
         store.delete_chunks(batch)
         meta["lastMerged"] = batch[-1]
         meta["expectedChunk"] = batch[-1] + 1
@@ -61,7 +61,7 @@ def finalize_session(store: SessionStore) -> dict | None:
 
     remaining = store.stored_sequences()
     if remaining:
-        append_to_recording(store, remaining)
+        append_chunks_to_ts(store, remaining)
         store.delete_chunks(remaining)
         meta["lastMerged"] = max(meta.get("lastMerged", -1), remaining[-1])
         meta["lastReceived"] = max(meta.get("lastReceived", -1), remaining[-1])

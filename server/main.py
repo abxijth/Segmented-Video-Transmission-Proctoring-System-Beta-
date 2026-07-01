@@ -26,8 +26,11 @@ import uvicorn
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Path, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
+import os
+
 from server.config import ServerConfig
 from server.locks import session_lock
+from server.merger import build_mp4_from_ts
 from server.storage import SessionStore, list_sessions
 from server.worker import MergeWorker, finalize_session
 from shared.protocol import (
@@ -129,17 +132,33 @@ def status(exam_id: str, student_id: str):
     return {
         **meta,
         "pendingChunks": len(store.stored_sequences()),  # not yet merged
-        "hasRecording": store.recording_exists(),
+        "hasRecording": store.recording_ts_exists(),
     }
 
 
 @app.get("/exams/{exam_id}/{student_id}/recording.mp4")
 def download_recording(exam_id: str, student_id: str):
     store = _store(exam_id, student_id)
-    if not store.recording_exists():
+    if not store.recording_ts_exists():
         raise HTTPException(status_code=404, detail="recording not ready")
+
+    # Build (or rebuild) the MP4 from the TS accumulator only if stale. This
+    # lazy, cached conversion is the one O(total) step — done at review time,
+    # not when the exam ends, so it never spikes.
+    with session_lock(exam_id, student_id):
+        if _mp4_is_stale(store):
+            build_mp4_from_ts(store)
+
     return FileResponse(store.recording_path, media_type="video/mp4",
                         filename=f"{exam_id}_{student_id}.mp4")
+
+
+def _mp4_is_stale(store: SessionStore) -> bool:
+    if not store.recording_exists():
+        return True
+    # Rebuild if more footage has been appended to the TS since the last build.
+    return os.path.getmtime(store.recording_ts_path) > \
+        os.path.getmtime(store.recording_path)
 
 
 @app.get("/exams")

@@ -32,13 +32,12 @@ class ClientConfig:
     frame_height: int = 720
     fps: int = 30
 
-    # --- Chunking ---
+    # --- Chunking / encoding ---
     chunk_seconds: float = 5.0
-    # FourCC for OpenCV's MP4 writer:
-    #   "mp4v" -> MPEG-4 Part 2: most portable, works everywhere out of the box.
-    #   "avc1" -> H.264: requires an OpenCV build with H.264 support.
-    # The roadmap targets H.264; flip this once your environment supports it.
-    chunk_fourcc: str = os.environ.get("PROCTOR_FOURCC", "mp4v")
+    # Chunks are H.264 (required by the server's scalable MPEG-TS merge),
+    # encoded via ffmpeg. Leave ffmpeg_bin empty to auto-discover ffmpeg
+    # (bundled next to the exe, or on PATH); set to force a specific binary.
+    ffmpeg_bin: str = os.environ.get("PROCTOR_FFMPEG", "")
 
     # --- Local disk queue ---
     # Chunks are written here and only deleted after the server ACKs them, so
@@ -56,7 +55,7 @@ class ClientConfig:
 
     @property
     def codec_name(self) -> str:
-        return "H264" if self.chunk_fourcc in ("avc1", "h264", "H264") else "MPEG4"
+        return "H264"
 
     @property
     def session_queue_dir(self) -> str:

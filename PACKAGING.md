@@ -5,6 +5,21 @@ PyInstaller — no Python install, no `pip`, no dependencies needed on the
 student's machine. The bundle includes the Python runtime, OpenCV, NumPy, and
 `requests`.
 
+## ffmpeg is required (bundle it)
+
+The client encodes H.264 chunks with **ffmpeg**, so the machine running the exe
+needs ffmpeg. Two options:
+
+- **Bundle it (recommended for distribution):** download a static ffmpeg for the
+  target OS and drop it in a `vendor/` folder at the repo root before building:
+  - Windows → `vendor/ffmpeg.exe`  (from https://www.gyan.dev/ffmpeg/builds/)
+  - Linux/macOS → `vendor/ffmpeg`   (from https://ffmpeg.org/download.html)
+
+  The `.spec` bundles it into the exe automatically; `client/media.py` finds it
+  inside the bundle at runtime. Nothing else to install on student machines.
+- **Rely on PATH:** if ffmpeg is already installed on the student machines, you
+  can skip `vendor/` — the client falls back to the ffmpeg on PATH.
+
 ## Important: one build per operating system
 
 PyInstaller **does not cross-compile.** A build produces an executable only for

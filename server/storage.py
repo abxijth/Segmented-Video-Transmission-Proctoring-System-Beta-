@@ -42,7 +42,20 @@ class SessionStore:
 
     @property
     def recording_path(self) -> str:
+        """Final MP4, built on demand from the .ts accumulator (see merger)."""
         return os.path.join(self._base, "recording.mp4")
+
+    @property
+    def recording_ts_path(self) -> str:
+        """MPEG-TS accumulator that chunks are appended to during the exam.
+
+        TS concatenates by byte-append, so extending it is O(chunk) rather than
+        O(whole recording) — the property that makes the merge scale.
+        """
+        return os.path.join(self._base, "recording.ts")
+
+    def recording_ts_exists(self) -> bool:
+        return os.path.exists(self.recording_ts_path)
 
     def chunk_path(self, sequence: int) -> str:
         return os.path.join(self._chunks_dir, chunk_filename(sequence))

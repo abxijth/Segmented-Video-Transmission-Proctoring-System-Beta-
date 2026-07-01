@@ -9,11 +9,21 @@ that platform's executable. PyInstaller does NOT cross-compile.
     pyinstaller proctor-client.spec
 """
 
+import os
 from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs
 
 # OpenCV ships compiled libraries and submodules PyInstaller must be told about.
 hiddenimports = collect_submodules("cv2") + ["numpy"]
 binaries = collect_dynamic_libs("cv2")
+
+# Bundle ffmpeg (required to encode H.264 chunks) if a copy is placed in
+# vendor/. On Windows put vendor/ffmpeg.exe; on Linux/macOS vendor/ffmpeg.
+# It lands at the bundle root, where client/media.py looks for it. If absent,
+# the client falls back to an ffmpeg on the machine's PATH.
+_ffmpeg_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+_ffmpeg_vendor = os.path.join("vendor", _ffmpeg_name)
+if os.path.isfile(_ffmpeg_vendor):
+    binaries += [(_ffmpeg_vendor, ".")]
 
 a = Analysis(
     ["proctor_client.py"],

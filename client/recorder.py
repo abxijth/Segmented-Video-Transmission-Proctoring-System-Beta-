@@ -1,13 +1,16 @@
-"""Chunk Recorder — capture frames and write them as rotating MP4 chunks.
+"""Chunk Recorder — capture frames and write them as rotating H.264 chunks.
 
 Runs in its own thread. Every `chunk_seconds` it closes the current MP4 and
 opens the next one, so the disk queue fills with independently-playable
 ~5-second clips numbered in sequence.
 
+Frames are captured with OpenCV but encoded to H.264 by piping them into an
+ffmpeg subprocess (see client/media.py) — H.264 is required by the server's
+scalable MPEG-TS merge, and OpenCV cannot encode it.
+
 Write-then-rename: each chunk is written to a staging name (`.chunk_NNNNNN.mp4`)
 and renamed to its final `chunk_NNNNNN.mp4` only when complete, so the uploader
-can never pick up a half-written file. The staging name still ends in `.mp4` so
-OpenCV's VideoWriter selects the MP4 container correctly.
+can never pick up a half-written file.
 """
 
 from __future__ import annotations
@@ -16,11 +19,10 @@ import os
 import threading
 import time
 
-import cv2
-
 from client.camera import CameraManager
 from client.config import ClientConfig
 from client.disk_queue import DiskQueue
+from client.media import FfmpegChunkWriter, find_ffmpeg
 
 
 class ChunkRecorder:
@@ -30,7 +32,13 @@ class ChunkRecorder:
         self._camera = camera
         self._queue = queue
 
-        self._fourcc = cv2.VideoWriter_fourcc(*config.chunk_fourcc)
+        self._ffmpeg_bin = find_ffmpeg(config.ffmpeg_bin)
+        if self._ffmpeg_bin is None:
+            raise RuntimeError(
+                "ffmpeg was not found. It is required to encode H.264 chunks. "
+                "Install ffmpeg and put it on PATH, set PROCTOR_FFMPEG to its "
+                "path, or place ffmpeg next to the executable.")
+
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="recorder",
                                          daemon=True)
@@ -75,13 +83,8 @@ class ChunkRecorder:
         part_path = self._queue.staging_path_for(sequence)
         fps = self._config.fps
 
-        writer = cv2.VideoWriter(part_path, self._fourcc, fps, (width, height))
-        if not writer.isOpened():
-            raise RuntimeError(
-                f"VideoWriter could not open {part_path!r} with fourcc "
-                f"{self._config.chunk_fourcc!r}. Your OpenCV build may not "
-                f"support this codec — try 'mp4v' (default) or 'avc1' in "
-                f"client/config.py.")
+        writer = FfmpegChunkWriter(part_path, width, height, fps,
+                                   self._ffmpeg_bin)
 
         target_total = int(round(self._config.chunk_seconds * fps))
         start = time.monotonic()
@@ -105,7 +108,7 @@ class ChunkRecorder:
 
                 time.sleep(0.002)  # yield; avoids a busy-spin between frames
         finally:
-            writer.release()
+            writer.close()
 
         # Publish the chunk to the queue only if it actually has content.
         if frames_written > 0:

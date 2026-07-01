@@ -1,14 +1,24 @@
-"""Merge Service — folds stored chunks into a single recording.mp4.
+"""Merge Service — scalable, incremental, low-end-of-exam-load.
 
-Uses ffmpeg's concat demuxer with stream copy (`-c copy`): no re-encoding, so
-it is fast and lossless. The server never decodes H.264 during normal
-operation, exactly as the roadmap specifies — it just stitches containers.
+The problem with rebuilding recording.mp4 from all chunks (or re-muxing the
+whole growing file each cycle) is O(n^2) I/O over a long exam: unusable at 300
+students x 3 hours.
 
-Strategy: **incremental append.** Each merge concatenates the existing
-recording.mp4 (if any) with the next contiguous batch of chunks and replaces
-recording.mp4. The merged chunks are then safe to delete, which keeps disk
-usage bounded during long exams (unlike a full rebuild, which needs every
-chunk to remain on disk forever).
+Strategy here: **append to an MPEG-TS accumulator.**
+
+  During the exam   each new chunk is remuxed to MPEG-TS (stream copy, O(chunk))
+                    and its bytes are appended to recording.ts. TS is designed
+                    to concatenate by raw byte-append, so extending the
+                    recording never re-copies what is already there. Work is
+                    tiny and spread evenly across the whole exam.
+  At finalize       nothing heavy — recording.ts is already complete. No spike
+                    when 300 students stop at once.
+  At download       recording.mp4 is produced on demand from recording.ts
+                    (one stream-copy pass) and cached. This naturally staggers
+                    the only O(total) step across whenever proctors review.
+
+Requires H.264 chunks: MPEG-TS cannot carry MPEG-4 Part 2 (OpenCV 'mp4v').
+The client encodes H.264 via ffmpeg for exactly this reason.
 """
 
 from __future__ import annotations
@@ -24,55 +34,72 @@ class MergeError(RuntimeError):
     pass
 
 
-def append_to_recording(store: SessionStore, sequences: list[int]) -> None:
-    """Append `sequences` (in order) to recording.mp4, creating it if needed.
+def append_chunks_to_ts(store: SessionStore, sequences: list[int]) -> None:
+    """Append `sequences` (in order) to recording.ts. O(size of the batch).
 
-    Caller must hold the session lock and pass a contiguous, in-order batch
-    that immediately follows whatever is already in recording.mp4.
+    Caller holds the session lock and passes chunks in ascending order.
     """
     if not sequences:
         return
 
-    inputs: list[str] = []
-    if store.recording_exists():
-        # Put the current recording first so the new chunks extend it.
-        inputs.append(store.recording_path)
-    inputs.extend(store.chunk_path(seq) for seq in sequences)
-
-    concat_list = _write_concat_list(inputs)
+    concat_list = _write_concat_list(
+        [store.chunk_path(seq) for seq in sequences])
+    fd, batch_ts = tempfile.mkstemp(suffix=".ts")
+    os.close(fd)
     try:
-        _run_ffmpeg_concat(concat_list, store.recording_path)
+        _run_ffmpeg([
+            "-f", "concat", "-safe", "0", "-i", concat_list,
+            "-c", "copy", "-f", "mpegts", batch_ts,
+        ], "remux batch to TS")
+        # Byte-append the batch onto the accumulator — no re-copy of the whole
+        # recording, which is what keeps this O(chunk) instead of O(total).
+        with open(store.recording_ts_path, "ab") as dst, \
+                open(batch_ts, "rb") as src:
+            _copy_stream(src, dst)
     finally:
         os.remove(concat_list)
+        if os.path.exists(batch_ts):
+            os.remove(batch_ts)
 
 
+def build_mp4_from_ts(store: SessionStore) -> None:
+    """Produce recording.mp4 from recording.ts (one stream-copy pass).
+
+    Called lazily on download, not during the exam, so its O(total) cost is
+    spread across review time rather than spiking when everyone finishes.
+    """
+    if not store.recording_ts_exists():
+        raise MergeError("no recording.ts to build from")
+
+    tmp_out = store.recording_path + ".building.mp4"
+    _run_ffmpeg([
+        "-i", store.recording_ts_path,
+        "-c", "copy", "-movflags", "+faststart", tmp_out,
+    ], "build mp4 from TS")
+    os.replace(tmp_out, store.recording_path)
+
+
+# --- helpers ----------------------------------------------------------------
 def _write_concat_list(input_paths: list[str]) -> str:
-    """Write the ffmpeg concat demuxer input file, return its path."""
     fd, path = tempfile.mkstemp(suffix=".txt")
     with os.fdopen(fd, "w") as fh:
         for input_path in input_paths:
-            # ffmpeg concat needs absolute, single-quote-escaped paths.
-            abs_path = os.path.abspath(input_path)
-            safe = abs_path.replace("'", "'\\''")
+            safe = os.path.abspath(input_path).replace("'", "'\\''")
             fh.write(f"file '{safe}'\n")
     return path
 
 
-def _run_ffmpeg_concat(concat_list: str, output_path: str) -> None:
-    # Write to a temp file in the same dir, then rename, so a reader never sees
-    # a half-built recording.mp4 (and so an input == output is never clobbered).
-    tmp_out = output_path + ".building.mp4"
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "concat", "-safe", "0", "-i", concat_list,
-        "-c", "copy",
-        tmp_out,
-    ]
+def _copy_stream(src, dst, bufsize: int = 1 << 20) -> None:
+    while True:
+        block = src.read(bufsize)
+        if not block:
+            return
+        dst.write(block)
+
+
+def _run_ffmpeg(args: list[str], what: str) -> None:
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        if os.path.exists(tmp_out):
-            os.remove(tmp_out)
-        raise MergeError(
-            f"ffmpeg concat failed (code {result.returncode}): "
-            f"{result.stderr.strip()}")
-    os.replace(tmp_out, output_path)
+        raise MergeError(f"ffmpeg failed to {what} "
+                         f"(code {result.returncode}): {result.stderr.strip()}")
