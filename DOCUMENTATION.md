@@ -270,9 +270,18 @@ produced, used to size the encoder). Usable as a context manager.
 
 - `find_ffmpeg(override)` locates ffmpeg: explicit override → bundled next
   to/inside the packaged exe → system PATH.
-- `FfmpegChunkWriter` spawns one ffmpeg per chunk (`-f rawvideo` in, `libx264
-  -preset ultrafast` out) and encodes raw BGR frames written to its stdin into
-  an H.264 MP4. `close()` flushes and raises if ffmpeg failed.
+- `detect_h264_encoder(ffmpeg_bin)` runs `ffmpeg -encoders` once (cached) and
+  returns the best available H.264 encoder in preference order — `libx264` →
+  `libopenh264` → hardware (`h264_v4l2m2m`/`h264_vaapi`/`h264_nvenc`/
+  `h264_qsv`). This is why the client runs on ffmpeg builds **without** libx264
+  (e.g. Fedora's `ffmpeg-free`, which ships Cisco's `libopenh264` instead). The
+  recorder resolves the encoder at startup and fails fast with a clear message
+  if none exists. Any of these produces H.264 the server stream-copies into its
+  TS accumulator, so the encoder choice is invisible to the server.
+- `FfmpegChunkWriter` spawns one ffmpeg per chunk (`-f rawvideo` in, the chosen
+  encoder out — `libx264 -preset ultrafast`, or `-b:v 2500k` for openh264 /
+  hardware) and encodes raw BGR frames written to its stdin into an H.264 MP4.
+  `close()` flushes and raises if ffmpeg failed.
 
 ### 7.4 `client/recorder.py` — `ChunkRecorder`
 

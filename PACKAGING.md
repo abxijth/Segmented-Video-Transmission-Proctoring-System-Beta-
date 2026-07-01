@@ -20,6 +20,13 @@ needs ffmpeg. Two options:
 - **Rely on PATH:** if ffmpeg is already installed on the student machines, you
   can skip `vendor/` — the client falls back to the ffmpeg on PATH.
 
+> **The ffmpeg must have an H.264 encoder.** The client auto-detects one
+> (`libx264` → `libopenh264` → hardware), so most builds work as-is. The
+> exception is Fedora's default `ffmpeg-free`, which omits `libx264` for patent
+> reasons — install `openh264` (`sudo dnf install openh264 ffmpeg-free`) or swap
+> to RPM Fusion's full `ffmpeg`, or just bundle a static build via `vendor/`.
+> The static gyan.dev / ffmpeg.org builds already include libx264.
+
 ## Important: one build per operating system
 
 PyInstaller **does not cross-compile.** A build produces an executable only for

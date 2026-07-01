@@ -5,6 +5,12 @@ reasons), and the server's scalable MPEG-TS merge requires H.264. So we capture
 frames with OpenCV but encode each chunk by piping raw BGR frames into ffmpeg,
 which produces a proper H.264 MP4.
 
+Not every ffmpeg build ships `libx264` — Fedora's default `ffmpeg-free`, for
+example, omits it for patent reasons but includes Cisco's `libopenh264`. So we
+detect at startup whichever H.264 encoder the local ffmpeg actually has, in
+preference order, and build the encode command to match. Any of them produces
+H.264 the server can stream-copy into its TS accumulator.
+
 `ffmpeg` is located from (in order): an explicit override, a copy bundled next
 to / inside the packaged executable, or the system PATH.
 """
@@ -12,9 +18,11 @@ to / inside the packaged executable, or the system PATH.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
+from functools import lru_cache
 
 
 def find_ffmpeg(override: str | None = None) -> str | None:
@@ -40,11 +48,47 @@ def find_ffmpeg(override: str | None = None) -> str | None:
     return shutil.which("ffmpeg")
 
 
+# H.264 encoders we know how to drive, best first. libx264 gives the best
+# quality/CPU trade-off; libopenh264 is the common fallback on Fedora and other
+# builds that omit libx264; the hardware encoders are last-resort.
+_H264_ENCODERS = ("libx264", "libopenh264", "h264_v4l2m2m",
+                  "h264_vaapi", "h264_nvenc", "h264_qsv")
+
+
+@lru_cache(maxsize=8)
+def detect_h264_encoder(ffmpeg_bin: str) -> str | None:
+    """Return the best available H.264 encoder for this ffmpeg, or None.
+
+    Cached per ffmpeg path so we only shell out to `ffmpeg -encoders` once.
+    """
+    try:
+        out = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for encoder in _H264_ENCODERS:
+        if re.search(rf"\b{re.escape(encoder)}\b", out):
+            return encoder
+    return None
+
+
+def _encoder_output_args(encoder: str) -> list[str]:
+    """ffmpeg output flags tuned per encoder (they take different options)."""
+    if encoder == "libx264":
+        # ultrafast keeps CPU low on student laptops.
+        return ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
+    # libopenh264 / hardware encoders don't accept -preset and default to a tiny
+    # bitrate; pin a sane one so the picture isn't a smear.
+    return ["-c:v", encoder, "-b:v", "2500k", "-pix_fmt", "yuv420p"]
+
+
 class FfmpegChunkWriter:
     """Encodes raw BGR frames to one H.264 MP4 chunk via ffmpeg's stdin."""
 
     def __init__(self, path: str, width: int, height: int, fps: int,
-                 ffmpeg_bin: str):
+                 ffmpeg_bin: str, encoder: str = "libx264"):
         self._path = path
         self._proc = subprocess.Popen(
             [
@@ -52,10 +96,9 @@ class FfmpegChunkWriter:
                 # raw input coming in on stdin
                 "-f", "rawvideo", "-pix_fmt", "bgr24",
                 "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
-                # H.264 output; ultrafast keeps CPU low on student laptops
-                "-c:v", "libx264", "-preset", "ultrafast",
-                "-pix_fmt", "yuv420p", "-an",
-                "-movflags", "+faststart",
+                # H.264 output; encoder + its flags chosen for this ffmpeg build
+                *_encoder_output_args(encoder),
+                "-an", "-movflags", "+faststart",
                 path,
             ],
             stdin=subprocess.PIPE,

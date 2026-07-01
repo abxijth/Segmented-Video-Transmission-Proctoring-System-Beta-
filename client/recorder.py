@@ -22,7 +22,11 @@ import time
 from client.camera import CameraManager
 from client.config import ClientConfig
 from client.disk_queue import DiskQueue
-from client.media import FfmpegChunkWriter, find_ffmpeg
+from client.media import (
+    FfmpegChunkWriter,
+    detect_h264_encoder,
+    find_ffmpeg,
+)
 
 
 class ChunkRecorder:
@@ -38,6 +42,19 @@ class ChunkRecorder:
                 "ffmpeg was not found. It is required to encode H.264 chunks. "
                 "Install ffmpeg and put it on PATH, set PROCTOR_FFMPEG to its "
                 "path, or place ffmpeg next to the executable.")
+
+        # Pick whichever H.264 encoder this ffmpeg build actually ships. Doing
+        # it once here fails fast (before recording) on builds that have no
+        # H.264 encoder at all, instead of on the first chunk.
+        self._encoder = detect_h264_encoder(self._ffmpeg_bin)
+        if self._encoder is None:
+            raise RuntimeError(
+                "this ffmpeg has no H.264 encoder (looked for libx264, "
+                "libopenh264, and hardware encoders). On Fedora install the "
+                "full build: `sudo dnf install openh264 ffmpeg-free` (or swap "
+                "to RPM Fusion's ffmpeg). Elsewhere install an ffmpeg with "
+                "libx264.")
+        print(f"[recorder] using H.264 encoder: {self._encoder}")
 
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="recorder",
@@ -84,7 +101,7 @@ class ChunkRecorder:
         fps = self._config.fps
 
         writer = FfmpegChunkWriter(part_path, width, height, fps,
-                                   self._ffmpeg_bin)
+                                   self._ffmpeg_bin, self._encoder)
 
         target_total = int(round(self._config.chunk_seconds * fps))
         start = time.monotonic()
