@@ -1,12 +1,13 @@
 # SEB Webcam Proctoring — Technical Documentation
 
-A complete reference for the prototype: what it does, how every piece works,
-the wire protocol, and exactly how to set it up and run it.
+A complete reference for the system: what it does, how every piece works, the
+wire protocol, and how to set it up, run it, and package it.
 
-> **Status:** working prototype (roadmap phases 1–8). It records a webcam into
-> short MP4 chunks on the student's laptop and uploads them to a server on the
-> proctor's laptop, which stores every chunk and merges them into one
-> `recording.mp4` per student. Built to survive network drops.
+> **Status:** working prototype. The client records the webcam into short
+> **H.264** MP4 chunks and uploads them to a server, which incrementally merges
+> them into one recording per student using an **MPEG-TS accumulator** so the
+> merge scales to many students over a multi-hour exam. Built to survive
+> network drops and client disconnects.
 
 ---
 
@@ -14,454 +15,409 @@ the wire protocol, and exactly how to set it up and run it.
 
 1. [What it does](#1-what-it-does)
 2. [How it works (the big picture)](#2-how-it-works-the-big-picture)
-3. [Project layout](#3-project-layout)
-4. [Setup](#4-setup)
-5. [Running it](#5-running-it)
-6. [Code walkthrough — client](#6-code-walkthrough--client)
-7. [Code walkthrough — server](#7-code-walkthrough--server)
-8. [The shared protocol](#8-the-shared-protocol)
-9. [HTTP API reference](#9-http-api-reference)
-10. [metadata.json schema](#10-metadatajson-schema)
-11. [Lifecycle scenarios](#11-lifecycle-scenarios)
-12. [Configuration reference](#12-configuration-reference)
-13. [Testing](#13-testing)
-14. [Troubleshooting](#14-troubleshooting)
-15. [Scaling notes](#15-scaling-notes)
+3. [Why H.264 + MPEG-TS (the merge strategy)](#3-why-h264--mpeg-ts-the-merge-strategy)
+4. [Project layout](#4-project-layout)
+5. [Setup](#5-setup)
+6. [Running it](#6-running-it)
+7. [Code walkthrough — client](#7-code-walkthrough--client)
+8. [Code walkthrough — server](#8-code-walkthrough--server)
+9. [The shared protocol](#9-the-shared-protocol)
+10. [HTTP API reference](#10-http-api-reference)
+11. [metadata.json schema](#11-metadatajson-schema)
+12. [Lifecycle scenarios](#12-lifecycle-scenarios)
+13. [Configuration reference](#13-configuration-reference)
+14. [Packaging the client (.exe)](#14-packaging-the-client-exe)
+15. [Testing](#15-testing)
+16. [Troubleshooting](#16-troubleshooting)
+17. [Scaling notes](#17-scaling-notes)
 
 ---
 
 ## 1. What it does
 
-- **Client** (student laptop): captures the webcam, encodes video, and writes
-  it to disk as a stream of short (~5 second) MP4 chunks. A background uploader
-  sends each chunk to the server over HTTP and deletes the local copy only
-  after the server confirms receipt.
-- **Server** (proctor laptop): authenticates each upload, stores the chunk,
-  records progress in a small JSON file, and merges the chunks — in order —
-  into a single playable `recording.mp4` per student.
+- **Client** (student laptop): captures the webcam, encodes **H.264** MP4 chunks
+  (~5 s each) via ffmpeg, and queues them on disk. A background uploader sends
+  each chunk to the server over HTTP and deletes the local copy only after the
+  server confirms receipt.
+- **Server** (proctor laptop): authenticates each upload and stores the chunk.
+  A background worker incrementally merges chunks into a per-student recording
+  and deletes the merged chunks. The final `recording.mp4` is produced on
+  demand when someone downloads it.
 
-Key property: **the local disk is the queue.** If the network drops, recording
-continues, chunks accumulate on disk, and the uploader keeps retrying until the
-connection returns. Nothing is lost.
+Key properties:
+
+- **The local disk is the queue.** Network drops don't lose data — chunks
+  accumulate and retry until connectivity returns.
+- **The server reaches a complete recording on its own.** A background worker
+  merges and cleans up even if the client crashes or never signals completion.
+- **The merge scales.** Work is spread evenly across the exam (see §3), with no
+  load spike when everyone finishes.
 
 ---
 
 ## 2. How it works (the big picture)
 
 ```
- STUDENT LAPTOP (client)                         PROCTOR LAPTOP (server)
-┌───────────────────────────────┐               ┌────────────────────────────────┐
-│ CameraManager                 │               │ FastAPI app                    │
-│   reads frames                │               │   POST .../chunks              │
-│        │                      │               │     │                          │
-│        ▼                      │   HTTP POST    │     ▼                          │
-│ ChunkRecorder ── chunk_000001 │  (one chunk    │  authenticate                 │
-│   rotates every ~5s           │   per request) │     │                          │
-│        │                      │ ─────────────► │  store chunk (SessionStore)   │
-│        ▼                      │                │     │                          │
-│ DiskQueue (folder on disk)    │                │  merge contiguous chunks      │
-│        │                      │ ◄───────────── │   (ffmpeg concat -c copy)     │
-│        ▼                      │   200 / 409    │     │                          │
-│ UploadManager                 │   (ACK)        │  update metadata.json         │
-│   upload → on ACK → delete    │                │     │                          │
-└───────────────────────────────┘               │     ▼  recording.mp4           │
-                                                 └────────────────────────────────┘
+ STUDENT LAPTOP (client)                          PROCTOR LAPTOP (server)
+┌──────────────────────────────┐                ┌───────────────────────────────────┐
+│ CameraManager (OpenCV)        │                │ FastAPI (sync upload handler,      │
+│      │ raw frames             │                │           threadpool)              │
+│      ▼                        │  POST chunk    │   store chunk → metadata → ACK     │
+│ FfmpegChunkWriter ── H.264 ──▶│ ─────────────▶ │        │ (fast, no merge here)     │
+│   (ffmpeg subprocess)         │  200 / 409     │        ▼                           │
+│      │ chunk_00001.mp4        │ ◀───────────── │   chunks/ on disk                  │
+│      ▼                        │                │                                    │
+│ DiskQueue (folder)            │                │ MergeWorker (background, ~10s)     │
+│      │                        │                │   append contiguous chunks ──▶     │
+│      ▼                        │                │   recording.ts  (byte-append)      │
+│ UploadManager (retry+ACK)     │                │   delete merged chunks             │
+└──────────────────────────────┘                │   auto-finalize idle sessions      │
+                                                 │        │                           │
+                                                 │        ▼  on download:             │
+                                                 │   recording.ts ──▶ recording.mp4   │
+                                                 └───────────────────────────────────┘
 ```
 
-**Two threads on the client**, running independently:
+**Client — two threads:**
+- The **recorder** thread captures frames and encodes rotating H.264 chunks,
+  dropping finished files into the queue folder.
+- The **uploader** thread uploads the oldest-numbered chunk first and deletes it
+  on ACK.
 
-- The **recorder thread** captures frames and rotates a new MP4 file every few
-  seconds, dropping finished chunks into the queue folder.
-- The **uploader thread** scans the queue folder, uploads the
-  oldest-numbered chunk first, and deletes it once the server ACKs.
+They communicate only through the disk queue folder, so a slow/absent network
+never blocks recording.
 
-Because the two threads only communicate through the **disk queue folder**, a
-slow or absent network never blocks recording.
-
-**On the server**, every upload runs through the same short pipeline:
-authenticate → store chunk → re-merge the contiguous run of chunks into
-`recording.mp4` → update `metadata.json`.
+**Server — request path is thin, worker does the heavy lifting:**
+- An **upload** only stores the chunk and returns immediately (the handler is
+  synchronous, so FastAPI runs it in a threadpool — many students upload in
+  parallel without blocking the event loop).
+- The **MergeWorker** runs in the background: it appends each session's next
+  contiguous batch of chunks to `recording.ts`, deletes the merged chunks, and
+  auto-finalizes sessions whose client has gone silent.
+- `recording.mp4` is built lazily from `recording.ts` when downloaded.
 
 ---
 
-## 3. Project layout
+## 3. Why H.264 + MPEG-TS (the merge strategy)
+
+The naïve approach — rebuild `recording.mp4` from all chunks (or re-mux the
+whole growing file) on each merge — is **O(n²)** disk I/O over a long exam:
+unusable at hundreds of students × hours.
+
+The fix uses two container formats for what each is good at:
+
+- **MPEG-TS (`.ts`)** splits media into small self-contained packets with *no
+  global index*, so two `.ts` files concatenate by **raw byte-append**.
+  Extending the recording is therefore **O(size of the new chunk)**, never
+  O(whole recording).
+- **MP4** has a `moov` index that must be rewritten to append — great for
+  playback/seeking, bad for appending.
+
+So:
+
+| Phase | Action | Cost |
+|---|---|---|
+| During the exam | remux each chunk to TS (stream copy) and **byte-append** to `recording.ts`; delete the chunk | tiny, spread across the whole exam |
+| At finalize | just stop — `recording.ts` is already complete | ~none (no end-of-exam spike) |
+| At download | build `recording.mp4` from `recording.ts` in one stream-copy pass, cached | one O(total) pass, staggered across review time |
+
+**H.264 is required** because MPEG-TS cannot carry MPEG-4 Part 2 (OpenCV's
+`mp4v`). OpenCV also cannot *encode* H.264 in typical builds, which is why the
+client encodes chunks with an ffmpeg subprocess instead of `cv2.VideoWriter`.
+
+---
+
+## 4. Project layout
 
 ```
 ICPC/
-├── README.md             quick start
-├── DOCUMENTATION.md      this file
-├── requirements.txt      Python dependencies
-├── .gitignore
+├── README.md               quick start
+├── DOCUMENTATION.md         this file
+├── PACKAGING.md             build the client into a standalone exe
+├── requirements.txt         runtime dependencies
+├── requirements-build.txt   + PyInstaller, for packaging
+├── proctor_client.py        PyInstaller entry point
+├── proctor-client.spec      PyInstaller build recipe
+├── proctor.ini.example      optional client config template
 │
-├── shared/               code shared by client AND server
-│   └── protocol.py       chunk naming, HTTP header names, metadata schema
+├── shared/
+│   └── protocol.py          chunk naming, HTTP headers, metadata schema
 │
-├── client/               runs on the student laptop
-│   ├── config.py         ClientConfig — all client tunables
-│   ├── camera.py         CameraManager — owns the webcam device
-│   ├── recorder.py       ChunkRecorder — frames → rotating MP4 chunks
-│   ├── disk_queue.py     DiskQueue — durable on-disk buffer
-│   ├── uploader.py       UploadManager — upload + retry + ACK-delete
-│   └── main.py           entry point; wires the pipeline together
+├── client/                  runs on the student laptop
+│   ├── config.py            ClientConfig (baked-in server URL, ffmpeg, etc.)
+│   ├── camera.py            CameraManager — OpenCV webcam capture
+│   ├── media.py             find_ffmpeg() + FfmpegChunkWriter (H.264 encode)
+│   ├── recorder.py          ChunkRecorder — frames → rotating H.264 chunks
+│   ├── disk_queue.py        DiskQueue — durable on-disk buffer
+│   ├── uploader.py          UploadManager — upload + retry + ACK-delete
+│   └── main.py              settings resolution + run loop
 │
-└── server/               runs on the proctor laptop
-    ├── config.py         ServerConfig — all server tunables
-    ├── storage.py        SessionStore — the only file-touching module
-    ├── merger.py         merge chunks → recording.mp4 via ffmpeg
-    └── main.py           FastAPI app + entry point
+├── server/                  runs on the proctor laptop
+│   ├── config.py            ServerConfig (worker interval, stale timeout)
+│   ├── locks.py             per-session locks (uploads + worker coordinate)
+│   ├── storage.py           SessionStore — the only file-touching module
+│   ├── merger.py            TS append + on-demand mp4 build
+│   ├── worker.py            MergeWorker + merge_pending/finalize_session
+│   └── main.py              FastAPI app + entry point
+│
+├── build/                   local build scripts (build_windows.bat / _linux.sh)
+└── .github/workflows/       CI to build exes for Windows/Linux/macOS
 ```
-
-Design rule: **one responsibility per module.** The client never imports server
-code and vice-versa; the only thing they share is `shared/protocol.py`, which
-defines the contract between them.
 
 ---
 
-## 4. Setup
+## 5. Setup
 
 ### Prerequisites
 
-| Requirement | Why | Check |
+| Requirement | Where | Why |
 |---|---|---|
-| Python 3.10+ | runs both client and server | `python3 --version` |
-| ffmpeg on PATH | server merges chunks; tests generate chunks | `ffmpeg -version` |
-| A webcam | client capture (client laptop only) | — |
-| Two machines on one LAN | real deployment (or use one machine to test) | — |
+| Python 3.10+ | client & server | runs the code |
+| **ffmpeg on PATH** | **client** (encode) **and server** (merge) | H.264 encode + TS/MP4 mux |
+| A webcam | client | capture |
+| Two machines on one LAN | deployment | (or use one machine to test) |
+
+> ffmpeg is now required on the **client** too (for H.264 encoding), not just
+> the server. For a packaged client you can bundle ffmpeg — see §14.
 
 ### Install
 
-Run this on **both** laptops (the client laptop needs OpenCV; the server laptop
-needs FastAPI — installing everything on both is simplest):
-
 ```bash
-cd ICPC
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt`:
-
-```
-opencv-python>=4.8     # client: webcam capture + MP4 writing
-requests>=2.31         # client: HTTP uploads
-fastapi>=0.110         # server: web framework
-uvicorn[standard]      # server: ASGI server
-python-multipart       # server: parse multipart file uploads
-```
-
-> **ffmpeg vs OpenCV.** OpenCV (on the client) *writes* the chunk MP4s. ffmpeg
-> (on the server) *merges* them. The server never decodes video — it only
-> stitches containers — so the server side stays lightweight.
+`requirements.txt`: `opencv-python` (capture), `requests` (upload),
+`fastapi` + `uvicorn[standard]` + `python-multipart` (server).
 
 ---
 
-## 5. Running it
+## 6. Running it
 
-### Real deployment (two laptops)
+### Two laptops
 
-**Step 1 — start the server** on the proctor laptop and note its LAN IP:
+**Server** (proctor laptop; note its LAN IP):
 
 ```bash
-source .venv/bin/activate
 python -m server.main
 # [server] storage at ./storage
 # [server] listening on http://0.0.0.0:8000
+# [worker] started: merge every 10s, auto-finalize after 60s idle
 ```
 
-Find the LAN IP: `ip addr` (Linux), `ipconfig` (Windows), or
-`ipconfig getifaddr en0` (macOS). Say it's `192.168.1.50`.
-
-**Step 2 — start the client** on the student laptop:
+**Client** (student laptop):
 
 ```bash
-source .venv/bin/activate
 python -m client.main --server http://192.168.1.50:8000 \
                       --exam exam2026 --student student001
 ```
 
-You'll see a live status line:
+Live status line: `[client] recorded=7 uploaded=6 queued=1`. Stop with
+`Ctrl+C` — the client drains the queue before exiting.
 
-```
-[client] recorded=7 uploaded=6 queued=1
-```
+> The client's server URL has a **baked-in default** (see
+> `DEFAULT_SERVER_URL` in `client/config.py`), so `--server` is optional once
+> set. Resolution order: CLI flag > `PROCTOR_SERVER` env > `proctor.ini` >
+> baked default.
 
-**Step 3 — stop** with `Ctrl+C`. The client finalizes: it stops recording,
-drains any remaining queued chunks to the server, and exits.
-
-### Get the result
-
-```bash
-# session status (counts + metadata)
-curl http://192.168.1.50:8000/exams/exam2026/student001/status
-
-# download the merged recording
-curl -O http://192.168.1.50:8000/exams/exam2026/student001/recording.mp4
-```
-
-### Test on a single machine (no second laptop)
-
-Open two terminals on the same computer:
+### Single machine (testing)
 
 ```bash
 # terminal 1
 python -m server.main
-
 # terminal 2
-python -m client.main --server http://127.0.0.1:8000 \
-                      --exam exam2026 --student student001
+python -m client.main --server http://127.0.0.1:8000 --exam exam2026 --student student001
 ```
 
-### CLI flags (client)
+### Get the result
+
+```bash
+curl http://<server>:8000/exams/exam2026/student001/status
+curl -O http://<server>:8000/exams/exam2026/student001/recording.mp4
+```
+
+### Client CLI flags
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--server` | *(required)* | server base URL, e.g. `http://192.168.1.50:8000` |
-| `--exam` | *(required)* | exam id (becomes a storage folder) |
-| `--student` | *(required)* | student id (becomes a storage folder) |
+| `--server` | baked-in URL | server base URL |
+| `--exam` | prompt / `exam2026` | exam id |
+| `--student` | prompt | student id |
 | `--camera` | `0` | webcam device index |
-| `--chunk-seconds` | `5.0` | length of each chunk |
+| `--chunk-seconds` | `5.0` | chunk length |
 
 ---
 
-## 6. Code walkthrough — client
+## 7. Code walkthrough — client
 
-The client is a small pipeline. Data flows **camera → recorder → disk queue →
-uploader → server**. Each stage is one class.
+Pipeline: **camera → recorder (ffmpeg H.264) → disk queue → uploader → server.**
 
-### 6.1 `client/config.py` — `ClientConfig`
+### 7.1 `client/config.py` — `ClientConfig`
 
-A single dataclass holding every tunable so there are no magic numbers spread
-through the code. Notable fields:
+Dataclass of all tunables (all have defaults, so a bare exe runs). Notable:
+`server_url` defaults to the baked-in `DEFAULT_SERVER_URL`; `ffmpeg_bin`
+(override the ffmpeg path, else auto-discover); `fps`, `chunk_seconds`,
+`queue_dir`, retry backoff. `session_queue_dir` isolates each session's chunks.
 
-- `server_url`, `exam_id`, `student_id`, `auth_token` — session identity.
-- `frame_width / frame_height / fps` — requested camera settings.
-- `chunk_seconds` — how often the recorder rotates to a new file.
-- `chunk_fourcc` — the codec FourCC for OpenCV's MP4 writer. `"mp4v"` (MPEG-4,
-  default) works everywhere; `"avc1"` is H.264 but needs an OpenCV build with
-  H.264 support.
-- `queue_dir` — where chunks live before upload.
-- `retry_base_delay / retry_max_delay` — exponential-backoff bounds.
+### 7.2 `client/camera.py` — `CameraManager`
 
-Helper properties:
+Thin wrapper over OpenCV `VideoCapture`. `open()`, `read_frame()` (returns
+`None` on a transient glitch), `actual_resolution` (the size the camera actually
+produced, used to size the encoder). Usable as a context manager.
 
-- `session_queue_dir` → `queue_dir/<exam>/<student>`, so two sessions never mix
-  their chunks.
-- `codec_name` → `"H264"` or `"MPEG4"` for reporting.
+### 7.3 `client/media.py` — ffmpeg encoding
 
-Environment overrides: `PROCTOR_TOKEN`, `PROCTOR_FOURCC`, `PROCTOR_QUEUE`.
+- `find_ffmpeg(override)` locates ffmpeg: explicit override → bundled next
+  to/inside the packaged exe → system PATH.
+- `FfmpegChunkWriter` spawns one ffmpeg per chunk (`-f rawvideo` in, `libx264
+  -preset ultrafast` out) and encodes raw BGR frames written to its stdin into
+  an H.264 MP4. `close()` flushes and raises if ffmpeg failed.
 
-### 6.2 `client/camera.py` — `CameraManager`
+### 7.4 `client/recorder.py` — `ChunkRecorder`
 
-A thin wrapper over OpenCV's `VideoCapture` so the rest of the client never
-touches OpenCV's device API directly.
+Own thread. Captures frames and writes **rotating H.264 chunks** — a new file
+every `chunk_seconds`. Details:
 
-- `open()` — opens the device, applies width/height/fps, raises if the camera
-  can't be opened.
-- `actual_resolution` — the size the camera *actually* gave (cameras often
-  ignore the requested size); the recorder uses this to size the MP4 writer
-  correctly.
-- `read_frame()` — returns the next BGR frame, or `None` on a transient glitch
-  (the recorder just tries again).
-- Usable as a context manager (`with CameraManager(cfg) as cam:`).
+- **Constant-rate, wall-clock-paced writing** so playback speed is correct:
+  a chunk tagged at `fps` always contains exactly `fps × chunk_seconds` frames;
+  if the camera runs behind, the latest frame is duplicated to keep the timeline
+  real-time (this fixes the earlier "sped-up video" bug).
+- **Write-then-rename**: encodes to a staging name (`.chunk_NNNNNN.mp4`) and
+  renames to the final name only when complete, so the uploader never grabs a
+  half-written file.
+- **Resume after a crash**: numbering continues after any leftover queued
+  chunks.
+- Raises a clear error at startup if **ffmpeg isn't found**.
 
-### 6.3 `client/disk_queue.py` — `DiskQueue`
+### 7.5 `client/disk_queue.py` — `DiskQueue`
 
-The durable buffer between recording and uploading. **The queue is just a
-folder.** That is what makes the system crash- and outage-resilient: anything
-not yet uploaded is still a file on disk after a restart.
+The durable buffer = a folder. `pending()` lists queued chunks oldest-first
+(ignoring staging files); `remove()` deletes on ACK; `path_for` /
+`staging_path_for` give final vs in-progress names.
 
-- `path_for(sequence)` → the on-disk path for chunk *N*.
-- `pending()` → all queued chunks as `(sequence, path)`, **oldest first**.
-  Files still being written carry a `.part` suffix and are ignored here, so the
-  uploader can never grab a half-written chunk.
-- `remove(path)` → delete a chunk after the server ACKs it (idempotent).
-- `is_empty()` → used by the uploader to know when it has fully drained.
+### 7.6 `client/uploader.py` — `UploadManager`
 
-Because chunk filenames are zero-padded (`chunk_000005.mp4`), a plain sorted
-directory listing is also the correct playback/upload order.
+Own thread. Uploads chunks in sequence order; deletes a chunk only after the
+server returns `200`/`201` (stored) or `409` (server already has it). Any error
+or non-OK status retries forever with exponential backoff — this is the offline
+recovery. `drain_and_stop()` flushes the queue at shutdown.
 
-### 6.4 `client/recorder.py` — `ChunkRecorder`
+### 7.7 `client/main.py` — entry & settings
 
-Runs on its own thread. Captures frames and writes them as **rotating** MP4
-chunks: every `chunk_seconds` it closes the current file and opens the next.
-
-Important details:
-
-- **Write-then-rename.** Each chunk is written to `chunk_NNNNNN.mp4.part` and
-  renamed to its final name only when complete (`os.replace`, an atomic rename).
-  The uploader therefore only ever sees finished chunks.
-- **Resume after a crash.** On startup the recorder inspects the queue and
-  continues numbering *after* any leftover chunks, so a restarted session never
-  overwrites chunks that haven't been uploaded yet.
-- **Glitch tolerance.** If `read_frame()` returns `None`, it skips and keeps
-  going rather than crashing.
-- **Empty-chunk guard.** If a rotation captured zero frames (e.g. camera
-  hiccup), the `.part` file is discarded instead of being published.
-
-`stop()` sets an event and joins the thread, so the in-progress chunk is closed
-cleanly on shutdown.
-
-### 6.5 `client/uploader.py` — `UploadManager`
-
-Runs on its own thread. Drains the queue to the server.
-
-- Uploads chunks **strictly in sequence order** (oldest first).
-- A chunk is deleted **only after** the server returns `200`/`201` (stored) or
-  `409` (server already has it — e.g. a duplicate after a retry). Either way the
-  client safely drops its local copy.
-- On any network error or non-OK status it **retries forever** with exponential
-  backoff (`retry_base_delay` doubling up to `retry_max_delay`). This is the
-  offline-recovery behavior: lose the network, chunks pile up, retry until it
-  returns.
-- `drain_and_stop(timeout)` — used at shutdown: keep uploading until the queue
-  is empty (or the timeout hits), then stop. Returns whether it fully drained.
-
-### 6.6 `client/main.py` — entry point
-
-Parses CLI args into a `ClientConfig`, opens the camera, then starts the
-recorder and uploader threads. The main thread prints a live status line until
-`Ctrl+C`, then:
-
-1. `recorder.stop()` — stop capturing (finishes the current chunk).
-2. `uploader.drain_and_stop()` — flush remaining chunks to the server.
-3. Reports how many chunks uploaded, or warns if some remain (they'll upload on
-   the next run, since the queue folder persists).
+`resolve_config()` gathers settings from CLI > env > `proctor.ini` (next to the
+exe) > interactive prompts (so a double-clicked exe works). `run(config)` opens
+the camera, starts the recorder + uploader threads, prints a status line until
+`Ctrl+C`, then finalizes.
 
 ---
 
-## 7. Code walkthrough — server
+## 8. Code walkthrough — server
 
-### 7.1 `server/config.py` — `ServerConfig`
+### 8.1 `server/config.py` — `ServerConfig`
 
-Host, port, `storage_root`, and `auth_token`. All overridable via environment
-variables: `PROCTOR_HOST`, `PROCTOR_PORT`, `PROCTOR_STORAGE`, `PROCTOR_TOKEN`.
+Host, port, `storage_root`, `auth_token`, plus worker tunables
+`merge_interval` (default 10 s) and `stale_after` (default 60 s). All overridable
+via env (`PROCTOR_*`).
 
-### 7.2 `server/storage.py` — `SessionStore`
+### 8.2 `server/locks.py`
 
-**The only module that touches the filesystem.** Scoped to one
-`(exam, student)` session. Swap this out (e.g. for S3) and nothing else changes.
+A registry of per-`(exam, student)` `threading.Lock`s shared by the upload
+handler and the worker, so a merge never races a concurrent upload while
+different students proceed in parallel.
 
-On-disk layout it manages:
+### 8.3 `server/storage.py` — `SessionStore`
+
+The only filesystem module. Manages:
 
 ```
 storage/<exam>/<student>/
-    chunks/chunk_000000.mp4
-    chunks/chunk_000001.mp4
-    ...
-    recording.mp4
+    chunks/chunk_000000.mp4 ...   (transient; deleted after merge)
+    recording.ts                  (TS accumulator, grows during exam)
+    recording.mp4                 (built on demand from the TS)
     metadata.json
 ```
 
-Methods:
+Key methods: `save_chunk` (atomic), `has_chunk`, `stored_sequences`,
+`contiguous_after(last_merged)` (the next gap-free batch to merge),
+`delete_chunks`, `recording_ts_path` / `recording_ts_exists`, and the metadata
+helpers.
 
-- `save_chunk(seq, data)` — atomic write (temp file + rename).
-- `has_chunk(seq)` — duplicate detection.
-- `stored_sequences()` — all stored chunk numbers, ascending.
-- `contiguous_sequences()` — **the key one.** Returns the longest gap-free run
-  `0,1,2,…`. Only this run is safe to merge; if chunk 3 is missing, the merge
-  stops at 2 even if chunk 4 has arrived.
-- `load_metadata()` / `save_metadata()` / `init_metadata_if_absent()` — manage
-  `metadata.json` (atomic writes).
+### 8.4 `server/merger.py` — the scalable merge
 
-Plus a module function `list_sessions(storage_root)` returning every
-`(exam, student)` on disk, used by the `/exams` endpoint.
+- `append_chunks_to_ts(store, sequences)` — remux the batch to MPEG-TS
+  (`-c copy`) and **byte-append** it to `recording.ts`. O(batch), no re-copy of
+  existing footage.
+- `build_mp4_from_ts(store)` — one stream-copy pass `recording.ts →
+  recording.mp4` (`+faststart`). Called lazily on download.
 
-### 7.3 `server/merger.py` — merge service
+Both raise `MergeError` on ffmpeg failure. The server never *decodes* video —
+only remuxes containers.
 
-`merge_recording(store)` rebuilds `recording.mp4` from the contiguous run of
-chunks and returns the highest sequence now included.
+### 8.5 `server/worker.py` — `MergeWorker`
 
-How:
+A daemon thread that, every `merge_interval`, walks every session and:
 
-1. Get `contiguous_sequences()`.
-2. Write an ffmpeg **concat demuxer** list file (`file '…/chunk_000000.mp4'`…).
-3. Run `ffmpeg -f concat -safe 0 -i list.txt -c copy recording.mp4.building.mp4`.
-   - `-c copy` = **stream copy, no re-encoding** — fast and lossless. The server
-     never decodes H.264.
-4. Atomically rename the `.building.mp4` into place, so a viewer downloading the
-   file never sees a half-built recording.
+1. `merge_pending` — append the next contiguous chunk batch to the TS, delete
+   the merged chunks, advance `lastMerged`.
+2. auto-finalize — if a session in `Recording` has received no chunk for
+   `stale_after` seconds (client disconnected), `finalize_session` flushes any
+   remaining chunks (across gaps) and marks it `Finalized`.
 
-Failures raise `MergeError`, which the API turns into an HTTP 500.
+`merge_pending` / `finalize_session` are also called directly by the `/finalize`
+endpoint. All assume the caller holds the session lock.
 
-> **Prototype trade-off.** It rebuilds the whole recording on every upload
-> (O(n²) over a long exam). Correct and simple; switch to incremental append
-> during load testing (roadmap phase 9). See [Scaling notes](#15-scaling-notes).
+### 8.6 `server/main.py` — FastAPI app
 
-### 7.4 `server/main.py` — FastAPI app
-
-Wires everything into HTTP endpoints. Highlights:
-
-- `require_auth` dependency checks the `Authorization: Bearer <token>` header
-  against the configured token; mismatch → `401`.
-- **Per-session lock.** A `defaultdict` of `threading.Lock` keyed by
-  `(exam, student)` serializes *store + merge* for one student, while different
-  students upload fully in parallel. This prevents two concurrent uploads for
-  the same student from racing on the merge.
-- The upload handler: validate sequence/body → (under the lock) reject
-  duplicates with `409` → `save_chunk` → update `lastReceived` → `merge` →
-  update `lastMerged` / `expectedChunk` → save metadata → ACK.
-
-See the full [API reference](#9-http-api-reference) below.
+- `lifespan` starts/stops the worker with the app.
+- `require_auth` checks the bearer token.
+- **Upload** (`POST .../chunks`) is a **sync** handler (threadpool): validate →
+  under the session lock, reject already-merged/duplicate sequences with `409`,
+  else `save_chunk`, update `lastReceived` / `lastChunkAt` / `status` → return
+  fast. **No merging on the request path.**
+- **Finalize** flushes + marks `Finalized`.
+- **Download** builds `recording.mp4` from the TS on demand (only if the TS grew
+  since the last build), then serves it.
+- **Status** returns metadata + `pendingChunks` + `hasRecording`.
 
 ---
 
-## 8. The shared protocol
+## 9. The shared protocol
 
-`shared/protocol.py` is the contract both sides agree on. Keeping it in one file
-means the client and server can never drift apart.
+`shared/protocol.py` — the contract both sides agree on.
 
-**Chunk naming**
+**Chunk naming:** `chunk_filename(5) → "chunk_000005.mp4"`, zero-padded so a
+sorted listing is playback order. `sequence_from_filename()` parses it back.
 
-```python
-chunk_filename(5)                       # -> "chunk_000005.mp4"
-sequence_from_filename("chunk_000005.mp4")  # -> 5
-```
-
-Zero-padded to 6 digits (`CHUNK_SEQ_WIDTH`), so lexical sort == numeric order.
-
-**HTTP contract**
+**HTTP contract:**
 
 | Constant | Value | Use |
 |---|---|---|
-| `UPLOAD_FILE_FIELD` | `chunk` | multipart file field name |
-| `HEADER_SEQUENCE` | `X-Chunk-Sequence` | which chunk number this is |
+| `UPLOAD_FILE_FIELD` | `chunk` | multipart file field |
+| `HEADER_SEQUENCE` | `X-Chunk-Sequence` | which chunk number |
 | `HEADER_AUTH` | `Authorization` | `Bearer <token>` |
 | `DEFAULT_AUTH_TOKEN` | `prototype-shared-secret` | override via `PROCTOR_TOKEN` |
 
-**Metadata**
-
-`new_metadata(...)` builds the initial `metadata.json`; status constants
-`STATUS_RECORDING` / `STATUS_FINALIZED`.
+**Metadata:** `new_metadata(...)` builds the initial `metadata.json`; status
+constants `STATUS_RECORDING` / `STATUS_FINALIZED`.
 
 ---
 
-## 9. HTTP API reference
+## 10. HTTP API reference
 
 Base URL: `http://<server>:8000`
 
-### `POST /exams/{exam_id}/{student_id}/chunks`
+### `POST /exams/{exam_id}/{student_id}/chunks` — upload one chunk (auth)
 
-Upload one chunk. **Auth required.**
-
-- Headers: `Authorization: Bearer <token>`, `X-Chunk-Sequence: <int>`
-- Body: multipart form, file field `chunk` (the MP4)
-
-Responses:
+Headers: `Authorization: Bearer <token>`, `X-Chunk-Sequence: <int>`.
+Body: multipart, file field `chunk`.
 
 | Status | Meaning | Client action |
 |---|---|---|
-| `200` | stored & merged | delete local copy |
-| `409` | server already had this chunk | delete local copy |
-| `400` | empty body or negative sequence | fix and resend |
+| `200` | stored | delete local copy |
+| `409` | already stored or already merged | delete local copy |
+| `400` | empty body / negative sequence | fix & resend |
 | `401` | bad/missing token | — |
-| `500` | merge failed | retry |
-
-Example `200` body:
-
-```json
-{ "status": "stored", "sequence": 7, "lastMerged": 7 }
-```
 
 ```bash
 curl -X POST http://127.0.0.1:8000/exams/exam2026/student001/chunks \
@@ -470,9 +426,7 @@ curl -X POST http://127.0.0.1:8000/exams/exam2026/student001/chunks \
   -F "chunk=@chunk_000000.mp4;type=video/mp4"
 ```
 
-### `POST /exams/{exam_id}/{student_id}/finalize`
-
-Force a final merge and mark the session `Finalized`. **Auth required.**
+### `POST /exams/{exam_id}/{student_id}/finalize` — flush + finalize (auth)
 
 ```json
 { "status": "Finalized", "lastMerged": 41 }
@@ -480,177 +434,153 @@ Force a final merge and mark the session `Finalized`. **Auth required.**
 
 ### `GET /exams/{exam_id}/{student_id}/status`
 
-Metadata plus live counts. No auth (read-only).
-
 ```json
 {
-  "studentId": "student001",
-  "examId": "exam2026",
-  "expectedChunk": 3,
-  "lastReceived": 4,
-  "lastMerged": 2,
-  "status": "Finalized",
-  "codec": "H264",
-  "resolution": "unknown",
-  "fps": 0,
-  "storedChunks": 4,
-  "contiguousChunks": 3,
-  "hasRecording": true
+  "studentId": "student001", "examId": "exam2026",
+  "expectedChunk": 42, "lastReceived": 41, "lastMerged": 41,
+  "lastChunkAt": 1751200000.0, "status": "Recording",
+  "codec": "H264", "resolution": "unknown", "fps": 0,
+  "pendingChunks": 0, "hasRecording": true
 }
 ```
 
 ### `GET /exams/{exam_id}/{student_id}/recording.mp4`
 
-Download the merged recording (`404` if not ready yet).
+Builds the MP4 from the TS on demand (cached) and returns it; `404` if no
+footage yet.
 
-### `GET /exams`
+### `GET /exams` — list sessions · `GET /health`
 
-List every session on disk.
-
-```json
-{ "sessions": [ { "examId": "exam2026", "studentId": "student001" } ] }
-```
-
-### `GET /health`
-
-`{ "status": "ok" }`
-
-> FastAPI also serves interactive docs at `http://<server>:8000/docs`.
+FastAPI also serves interactive docs at `/docs`.
 
 ---
 
-## 10. metadata.json schema
+## 11. metadata.json schema
 
-Written per student at `storage/<exam>/<student>/metadata.json`.
+`storage/<exam>/<student>/metadata.json`:
 
 | Field | Meaning |
 |---|---|
 | `studentId`, `examId` | session identity |
-| `expectedChunk` | next contiguous sequence the server wants (`lastMerged + 1`) |
-| `lastReceived` | highest sequence stored (may be ahead of merge if there's a gap) |
-| `lastMerged` | highest sequence folded into `recording.mp4` |
+| `expectedChunk` | next contiguous sequence wanted (`lastMerged + 1`) |
+| `lastReceived` | highest sequence stored |
+| `lastMerged` | highest sequence appended to `recording.ts` |
+| `lastChunkAt` | epoch seconds of the last upload (staleness detection) |
 | `status` | `Recording` or `Finalized` |
-| `codec` | reported codec label |
-| `resolution`, `fps` | reported capture settings |
-
-`lastReceived` ahead of `lastMerged` means chunks arrived out of order and a gap
-is still unfilled.
+| `codec`, `resolution`, `fps` | reported labels |
 
 ---
 
-## 11. Lifecycle scenarios
+## 12. Lifecycle scenarios
 
-**Normal chunk:**
-```
-record → write .part → rename to chunk_N → uploader POSTs →
-server stores → merges 0..N → 200 ACK → client deletes local chunk_N
-```
+**Normal chunk:** encode H.264 → stage → rename → upload → server stores → ACK →
+client deletes local copy → worker later appends it to `recording.ts` and
+deletes the server-side chunk.
 
-**Network drops mid-exam:**
-```
-recorder keeps writing chunks to disk (queue grows) →
-uploader's POST fails → backs off, retries → ...network returns...
-→ queued chunks upload oldest-first → queue drains
-```
+**Network drops:** recorder keeps writing chunks to disk (queue grows); uploads
+back off and retry; on reconnect the queue drains oldest-first.
 
-**Out-of-order / lost chunk:** chunk 3 never arrives, chunk 4 does. Server
-*stores* 4 (`lastReceived = 4`) but `contiguous_sequences()` stops at 2, so
-`recording.mp4` only contains 0–2 (`lastMerged = 2`). When 3 finally arrives,
-the next merge extends to 4 automatically.
+**Out-of-order / lost chunk:** a chunk after a gap is stored but not merged; the
+worker only appends the contiguous run, so `recording.ts` stops at the gap until
+it's filled. On finalize, remaining chunks are flushed across gaps.
 
-**Duplicate upload** (client retried after a missed ACK): server already has the
-chunk → returns `409` → client drops its copy. No corruption.
+**Duplicate upload:** server returns `409` (already stored or already merged);
+client drops its copy.
 
-**Client crash/restart:** the queue folder persists. On restart the recorder
-resumes numbering after the leftover chunks and the uploader flushes them.
+**Client crash/disconnect:** the worker keeps merging what arrived, and after
+`stale_after` seconds of silence auto-finalizes the session — a complete
+recording with no client action.
 
-**Graceful stop (`Ctrl+C`):** recorder stops, uploader drains the queue, session
-can be finalized.
+**Graceful stop (`Ctrl+C`):** recorder stops, uploader drains, session can be
+finalized (or the worker finalizes it as stale).
 
 ---
 
-## 12. Configuration reference
+## 13. Configuration reference
 
-### Client (`client/config.py` or env)
+### Client (`client/config.py` / env)
 
-| Setting | Default | Env override |
+| Setting | Default | Env |
 |---|---|---|
-| chunk length | `5.0 s` | — (or `--chunk-seconds`) |
+| server URL | baked `DEFAULT_SERVER_URL` | `PROCTOR_SERVER` |
+| chunk length | `5.0 s` | — (`--chunk-seconds`) |
 | resolution | `1280x720` | — |
 | fps | `30` | — |
-| codec FourCC | `mp4v` | `PROCTOR_FOURCC` |
-| queue dir | `./client_queue` | `PROCTOR_QUEUE` |
+| ffmpeg path | auto-discover | `PROCTOR_FFMPEG` |
+| queue dir | beside app / `./client_queue` | `PROCTOR_QUEUE` |
 | auth token | shared secret | `PROCTOR_TOKEN` |
-| retry backoff | `1s → 30s` | — |
 
-### Server (`server/config.py` or env)
+### Server (`server/config.py` / env)
 
-| Setting | Default | Env override |
+| Setting | Default | Env |
 |---|---|---|
-| host | `0.0.0.0` | `PROCTOR_HOST` |
-| port | `8000` | `PROCTOR_PORT` |
+| host / port | `0.0.0.0` / `8000` | `PROCTOR_HOST` / `PROCTOR_PORT` |
 | storage root | `./storage` | `PROCTOR_STORAGE` |
 | auth token | shared secret | `PROCTOR_TOKEN` |
+| merge interval | `10 s` | `PROCTOR_MERGE_INTERVAL` |
+| stale timeout | `60 s` | `PROCTOR_STALE_AFTER` |
 
-> The client and server **must share the same token.** Set `PROCTOR_TOKEN` to
-> the same value on both, or change `DEFAULT_AUTH_TOKEN` in `shared/protocol.py`.
-
----
-
-## 13. Testing
-
-The pipeline was verified end-to-end without a physical webcam by generating
-synthetic MP4 chunks with ffmpeg and pushing them through the real server and
-the real client upload classes. Verified behaviors:
-
-- store → merge contiguous chunks into a valid H.264 `recording.mp4`
-  (ffprobe-confirmed codec and duration)
-- duplicate chunk → `409`
-- gap handling: an out-of-order chunk is stored but not merged past the gap
-- auth rejection (`401`) on missing token
-- the real `DiskQueue` + `UploadManager` path: queue → upload in order →
-  delete on ACK
-
-To re-run a quick manual check on one machine: start the server, start the
-client against `127.0.0.1`, let it record for ~20s, `Ctrl+C`, then
-`GET .../status` and download `recording.mp4`.
+> Client and server **must share the same token**.
 
 ---
 
-## 14. Troubleshooting
+## 14. Packaging the client (.exe)
 
-| Symptom | Likely cause | Fix |
+Full guide in **`PACKAGING.md`**. In short:
+
+- `pyinstaller proctor-client.spec` builds a single self-contained executable
+  (Windows `ProctorClient.exe`, Linux/macOS `ProctorClient`). **PyInstaller does
+  not cross-compile** — build on each target OS, or use the included GitHub
+  Actions workflow.
+- **ffmpeg** (needed for H.264 encoding) is bundled if you drop a static binary
+  in `vendor/` (`vendor/ffmpeg.exe` on Windows), else the client uses ffmpeg on
+  PATH.
+- Settings resolve from CLI > env > `proctor.ini` (next to the exe) > prompts.
+  The server URL is baked in, so a bare exe already points at your server.
+
+---
+
+## 15. Testing
+
+Verified end-to-end (with ffmpeg-generated chunks and a fake camera, so no
+physical webcam needed):
+
+- scalable merge: TS byte-append, chunk deletion after merge, on-demand MP4
+  build (mid-exam and final), correct **H.264** duration, light finalize;
+- auto-finalize on client disconnect (stale detection);
+- real-time chunk duration despite a slow camera (speed fix);
+- full pipeline: camera → H.264 chunks → upload → TS merge → downloaded MP4;
+- duplicate → `409`, gap handling, `401` on bad token.
+
+---
+
+## 16. Troubleshooting
+
+| Symptom | Cause | Fix |
 |---|---|---|
-| `could not open camera index 0` | wrong index / camera in use | try `--camera 1`; close other apps using the webcam |
-| `VideoWriter failed for fourcc 'avc1'` | OpenCV build lacks H.264 | use `mp4v` (default), or move capture to an ffmpeg subprocess |
-| client prints `retry in Ns` forever | server unreachable / wrong IP / firewall | verify `--server` URL; `curl http://<ip>:8000/health`; open the port |
-| upload returns `401` | token mismatch | set the same `PROCTOR_TOKEN` on both sides |
-| `merge failed` / `ffmpeg ... not found` | ffmpeg missing on server | install ffmpeg, ensure it's on `PATH` |
-| `recording not ready` (404) | no contiguous chunks merged yet | wait for chunk 0+; check `/status` `contiguousChunks` |
-| recording shorter than expected | a gap (missing chunk) | check `lastReceived` vs `lastMerged`; the gap chunk never arrived |
-| chunks pile up in `client_queue/` | network was down, or drain timed out | they upload automatically on the next client run |
+| `ffmpeg was not found` (client) | no ffmpeg | install ffmpeg on PATH, set `PROCTOR_FFMPEG`, or bundle it (§14) |
+| `could not open camera index 0` | wrong index / in use | `--camera 1`; close other apps |
+| client retries forever | server unreachable / wrong IP / firewall | check URL; `curl http://<ip>:8000/health`; open the port |
+| `401` on upload | token mismatch | same `PROCTOR_TOKEN` on both sides |
+| `recording not ready` (404) | nothing merged yet | wait for the worker; check `/status` `hasRecording` |
+| recording shorter than expected | a gap (missing chunk) | compare `lastReceived` vs `lastMerged` |
+| merge/ffmpeg errors on server | server ffmpeg missing/old | install ffmpeg, ensure on PATH |
 
 ---
 
-## 15. Scaling notes
+## 17. Scaling notes
 
-Mapped to the roadmap's later phases — none are required for the prototype:
+The merge now scales (§3), and uploads run in a threadpool, so a single server
+handles many students. For a large exam (e.g. 300 students × 3 hours):
 
-- **HTTPS (production):** the prototype uses plain HTTP for LAN testing. Put the
-  server behind TLS (reverse proxy, or `uvicorn --ssl-keyfile/--ssl-certfile`).
-  The client already sends a bearer token; just change the `--server` URL to
-  `https://…`.
-- **True H.264:** flip `chunk_fourcc` to `avc1` once OpenCV supports it, or
-  capture via an ffmpeg subprocess for guaranteed H.264.
-- **Incremental merge:** replace the full rebuild in `merger.py` with an append
-  so merge cost stays O(1) per chunk during long exams / load testing.
-- **Object storage / distributed servers:** only `server/storage.py` and
-  `server/merger.py` touch the filesystem — reimplement those against S3 or a
-  shared store without changing the client or the API.
-- **Per-student tokens:** replace the single shared secret with tokens issued at
-  exam start (the header contract already supports it).
-- **Live dashboard / AI detection / screen + multi-camera:** additive features
-  from the roadmap's "future improvements" — the chunked-upload backbone here is
-  the foundation they build on.
-```
-
+- **Bandwidth:** ~60 MB/s (~480 Mbit/s) → **wired gigabit** to the server, not
+  WiFi.
+- **Storage:** ~1–2 GB/student → plan **hundreds of GB** free per exam.
+- **Static server IP:** reserve one before baking it into the client.
+- **Multiple workers / redundancy:** run several uvicorn workers and, ideally, a
+  second server with shared storage; the in-process locks would then move to a
+  shared store, and chunks/TS to shared or object storage — only
+  `server/storage.py` + `server/merger.py` touch the filesystem, so that's the
+  seam to change.
+- **HTTPS:** the prototype uses plain HTTP for LAN; put it behind TLS for
+  production (the client already sends a bearer token).
