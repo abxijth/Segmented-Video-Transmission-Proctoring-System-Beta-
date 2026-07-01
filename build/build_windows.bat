@@ -14,11 +14,14 @@ echo [build] installing dependencies...
 python -m pip install --upgrade pip || goto :error
 pip install -r requirements-build.txt || goto :error
 
+echo [build] fetching ffmpeg to bundle inside the exe...
+powershell -NoProfile -ExecutionPolicy Bypass -File "build\fetch_ffmpeg.ps1" || goto :error
+
 echo [build] running PyInstaller...
 pyinstaller --clean --noconfirm proctor-client.spec || goto :error
 
 echo.
-echo [build] DONE -> dist\ProctorClient.exe
+echo [build] DONE -> dist\ProctorClient.exe  (ffmpeg is bundled inside; no extra setup)
 echo Copy proctor.ini.example to proctor.ini next to the exe to preset settings.
 goto :eof
 

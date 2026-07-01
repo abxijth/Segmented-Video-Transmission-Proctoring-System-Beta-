@@ -5,27 +5,30 @@ PyInstaller — no Python install, no `pip`, no dependencies needed on the
 student's machine. The bundle includes the Python runtime, OpenCV, NumPy, and
 `requests`.
 
-## ffmpeg is required (bundle it)
+## ffmpeg is bundled automatically — students install nothing
 
-The client encodes H.264 chunks with **ffmpeg**, so the machine running the exe
-needs ffmpeg. Two options:
+The client encodes H.264 chunks with **ffmpeg**, so it must travel *inside* the
+exe. **The build handles this for you** — you do not download or install ffmpeg
+manually, and neither do the students:
 
-- **Bundle it (recommended for distribution):** download a static ffmpeg for the
-  target OS and drop it in a `vendor/` folder at the repo root before building:
-  - Windows → `vendor/ffmpeg.exe`  (from https://www.gyan.dev/ffmpeg/builds/)
-  - Linux/macOS → `vendor/ffmpeg`   (from https://ffmpeg.org/download.html)
+- `build\build_windows.bat` / `build/build_linux.sh` run a fetch step
+  (`build/fetch_ffmpeg.ps1` / `build/fetch_ffmpeg.sh`) that downloads a **static
+  ffmpeg** (with libx264) into `vendor/` before packaging.
+- The GitHub Actions workflow does the same on each OS runner.
+- The `.spec` then bundles `vendor/ffmpeg[.exe]` into the executable;
+  `client/media.py` finds it inside the bundle at runtime.
 
-  The `.spec` bundles it into the exe automatically; `client/media.py` finds it
-  inside the bundle at runtime. Nothing else to install on student machines.
-- **Rely on PATH:** if ffmpeg is already installed on the student machines, you
-  can skip `vendor/` — the client falls back to the ffmpeg on PATH.
+Result: **a single self-contained exe with zero external dependencies.** If you
+ever build with the raw `pyinstaller` command and forget to fetch ffmpeg, the
+spec prints a loud warning (the exe would then only work where ffmpeg is on
+PATH). To fetch it yourself: `powershell -ExecutionPolicy Bypass -File
+build\fetch_ffmpeg.ps1` (Windows) or `bash build/fetch_ffmpeg.sh` (Linux/macOS).
 
-> **The ffmpeg must have an H.264 encoder.** The client auto-detects one
-> (`libx264` → `libopenh264` → hardware), so most builds work as-is. The
-> exception is Fedora's default `ffmpeg-free`, which omits `libx264` for patent
-> reasons — install `openh264` (`sudo dnf install openh264 ffmpeg-free`) or swap
-> to RPM Fusion's full `ffmpeg`, or just bundle a static build via `vendor/`.
-> The static gyan.dev / ffmpeg.org builds already include libx264.
+> The static gyan.dev / johnvansickle / evermeet builds used by the fetch
+> scripts already include **libx264**. The client also auto-detects the encoder
+> at runtime (`libx264` → `libopenh264` → hardware), so it still runs if a
+> machine only has a system ffmpeg without libx264 (e.g. Fedora's `ffmpeg-free`,
+> which ships `libopenh264`).
 
 ## Important: one build per operating system
 
@@ -75,7 +78,8 @@ bash build/build_linux.sh
 
 ### What the scripts do
 
-Create a clean virtualenv, install `requirements-build.txt`, then run:
+Create a clean virtualenv, install `requirements-build.txt`, **fetch a static
+ffmpeg into `vendor/`**, then run:
 
 ```bash
 pyinstaller --clean --noconfirm proctor-client.spec

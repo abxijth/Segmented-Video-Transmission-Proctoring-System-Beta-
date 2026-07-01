@@ -15,9 +15,12 @@ echo "[build] installing dependencies..."
 python -m pip install --upgrade pip
 pip install -r requirements-build.txt
 
+echo "[build] fetching ffmpeg to bundle inside the binary..."
+bash build/fetch_ffmpeg.sh
+
 echo "[build] running PyInstaller..."
 pyinstaller --clean --noconfirm proctor-client.spec
 
 echo
-echo "[build] DONE -> dist/ProctorClient"
+echo "[build] DONE -> dist/ProctorClient  (ffmpeg is bundled inside; no extra setup)"
 echo "Copy proctor.ini.example to proctor.ini next to the binary to preset settings."

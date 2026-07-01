@@ -16,14 +16,22 @@ from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs
 hiddenimports = collect_submodules("cv2") + ["numpy"]
 binaries = collect_dynamic_libs("cv2")
 
-# Bundle ffmpeg (required to encode H.264 chunks) if a copy is placed in
-# vendor/. On Windows put vendor/ffmpeg.exe; on Linux/macOS vendor/ffmpeg.
-# It lands at the bundle root, where client/media.py looks for it. If absent,
-# the client falls back to an ffmpeg on the machine's PATH.
+# Bundle ffmpeg (required to encode H.264 chunks) from vendor/. On Windows put
+# vendor/ffmpeg.exe; on Linux/macOS vendor/ffmpeg. It lands at the bundle root,
+# where client/media.py looks for it, so the shipped exe has NO external deps.
+# The build scripts (build/fetch_ffmpeg.ps1 etc.) download it automatically.
 _ffmpeg_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
 _ffmpeg_vendor = os.path.join("vendor", _ffmpeg_name)
 if os.path.isfile(_ffmpeg_vendor):
     binaries += [(_ffmpeg_vendor, ".")]
+    print(f"[spec] bundling ffmpeg from {_ffmpeg_vendor}")
+else:
+    print("\n" + "!" * 70)
+    print(f"[spec] WARNING: {_ffmpeg_vendor} not found - ffmpeg will NOT be")
+    print("[spec] bundled. The exe will only work where ffmpeg is on PATH.")
+    print("[spec] Run the build script (build/fetch_ffmpeg.ps1) to fetch it,")
+    print("[spec] or place ffmpeg in vendor/ before building.")
+    print("!" * 70 + "\n")
 
 a = Analysis(
     ["proctor_client.py"],

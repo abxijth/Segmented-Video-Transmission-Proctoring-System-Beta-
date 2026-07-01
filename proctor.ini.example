@@ -1,13 +1,14 @@
 # Optional config for the packaged client.
 # Rename to `proctor.ini` and place it next to ProctorClient(.exe).
-# Anything set here is used unless overridden by a command-line flag.
-# If a value is missing here, the client falls back to env vars, then prompts.
+# The exe runs on a double-click with NO prompts; values here (or CLI flags /
+# env vars) override the baked-in defaults. If `student` is omitted the client
+# uses the machine's hostname, so it still runs unattended.
+#
+# For a real exam, ship each contestant a proctor.ini with THEIR student id.
 
 [client]
 server = http://192.168.1.50:8000
 exam = exam2026
-# student is intentionally left out so each student enters their own ID,
-# but you can pin it here too if you pre-provision per machine:
-# student = student001
+student = student001
 camera = 0
 chunk_seconds = 5

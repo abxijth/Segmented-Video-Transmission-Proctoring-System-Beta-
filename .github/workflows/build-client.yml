@@ -35,6 +35,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-build.txt
 
+      - name: Vendor ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: build/fetch_ffmpeg.ps1
+
+      - name: Vendor ffmpeg (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: bash build/fetch_ffmpeg.sh
+
       - name: Build executable
         run: pyinstaller --clean --noconfirm proctor-client.spec
 

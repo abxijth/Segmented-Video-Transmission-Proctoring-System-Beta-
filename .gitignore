@@ -9,6 +9,9 @@ venv/
 build/proctor-client/
 dist/
 
+# Downloaded ffmpeg binary (fetched by build/fetch_ffmpeg.* at build time)
+vendor/
+
 # Local machine config (ship proctor.ini.example, not the filled-in one)
 proctor.ini
 

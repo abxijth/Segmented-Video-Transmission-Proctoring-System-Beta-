@@ -5,11 +5,13 @@
 The recorder and uploader each run on their own thread; the main thread just
 waits for Ctrl+C, then finalizes (drains the queue) before exiting.
 
-Settings are resolved from, in priority order:
+Settings are resolved from, in priority order (nothing ever prompts, so the
+packaged exe runs fully hands-off on a double-click or when SEB launches it):
   1. command-line flags         (--server / --exam / --student / ...)
   2. environment variables      (PROCTOR_SERVER / PROCTOR_EXAM / PROCTOR_STUDENT)
   3. a `proctor.ini` file        next to the executable (or current dir)
-  4. interactive prompts         (so the packaged .exe works on double-click)
+  4. baked defaults              (server in client/config.py; exam "exam2026";
+                                  student = the machine hostname)
 
 Usage (from source):
     python -m client.main --server http://192.168.1.50:8000 \
@@ -21,6 +23,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import os
+import socket
 import sys
 import time
 
@@ -54,14 +57,16 @@ def _load_ini() -> dict:
     return dict(parser["client"])
 
 
-def _prompt(label: str, default: str | None = None) -> str:
-    suffix = f" [{default}]" if default else ""
-    while True:
-        value = input(f"{label}{suffix}: ").strip()
-        if value:
-            return value
-        if default:
-            return default
+def _default_student_id() -> str:
+    """Fallback identity when none is configured: the machine's hostname.
+
+    Keeps double-click / SEB-launched runs completely hands-off — the client
+    never has to stop and ask, and never crashes on a missing student id.
+    Sanitized so it is safe inside a URL path and a folder name.
+    """
+    host = socket.gethostname() or "student"
+    safe = "".join(c for c in host if c.isalnum() or c in "-_")
+    return safe or "student"
 
 
 def resolve_config(argv: list[str] | None = None) -> ClientConfig:
@@ -78,18 +83,13 @@ def resolve_config(argv: list[str] | None = None) -> ClientConfig:
     def pick(cli, env, key):
         return cli or os.environ.get(env) or ini.get(key)
 
-    server = pick(args.server, "PROCTOR_SERVER", "server")
-    exam = pick(args.exam, "PROCTOR_EXAM", "exam")
-    student = pick(args.student, "PROCTOR_STUDENT", "student")
-
-    # Server has a baked-in default (see client/config.py), so it never needs a
-    # prompt. Exam/student fall back to prompts only if still unset.
-    if not server:
-        server = DEFAULT_SERVER_URL
-    if not exam:
-        exam = _prompt("Exam ID", "exam2026")
-    if not student:
-        student = _prompt("Student ID")
+    # Fully hands-off resolution so the exe "just runs" on double-click:
+    #   CLI flag > env var > proctor.ini (next to the exe) > baked default.
+    # Nothing here ever prompts or blocks.
+    server = pick(args.server, "PROCTOR_SERVER", "server") or DEFAULT_SERVER_URL
+    exam = pick(args.exam, "PROCTOR_EXAM", "exam") or "exam2026"
+    student = (pick(args.student, "PROCTOR_STUDENT", "student")
+               or _default_student_id())
 
     camera = args.camera if args.camera is not None else int(ini.get("camera", 0))
     chunk_seconds = (args.chunk_seconds if args.chunk_seconds is not None
