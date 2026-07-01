@@ -75,13 +75,20 @@ def detect_h264_encoder(ffmpeg_bin: str) -> str | None:
 
 
 def _encoder_output_args(encoder: str) -> list[str]:
-    """ffmpeg output flags tuned per encoder (they take different options)."""
+    """ffmpeg output flags tuned per encoder (they take different options).
+
+    Tuned for small files at 720p proctoring quality. libx264 uses CRF (quality-
+    targeted, variable bitrate) which compresses far better than the old
+    `ultrafast` default; `veryfast` still keeps CPU low on student laptops.
+    """
     if encoder == "libx264":
-        # ultrafast keeps CPU low on student laptops.
-        return ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
-    # libopenh264 / hardware encoders don't accept -preset and default to a tiny
-    # bitrate; pin a sane one so the picture isn't a smear.
-    return ["-c:v", encoder, "-b:v", "2500k", "-pix_fmt", "yuv420p"]
+        # CRF 28 = visually fine for a webcam feed, much smaller than CRF 23.
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+                "-pix_fmt", "yuv420p"]
+    # libopenh264 / hardware encoders don't accept -preset/-crf; use a capped
+    # average bitrate that's sane for 720p (well below the old 2500k).
+    return ["-c:v", encoder, "-b:v", "1200k", "-maxrate", "1500k",
+            "-bufsize", "3000k", "-pix_fmt", "yuv420p"]
 
 
 class FfmpegChunkWriter:
