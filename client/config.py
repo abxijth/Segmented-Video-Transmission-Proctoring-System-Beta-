@@ -32,6 +32,18 @@ class ClientConfig:
     frame_height: int = 720
     fps: int = 30
 
+    # --- Microphone / audio ---
+    # Capture microphone audio and mux it (AAC) into every chunk. Detected once
+    # at startup so all chunks share the same stream layout (the server's TS
+    # concat requires that). Falls back to video-only if there is no working mic
+    # or permission is denied — recording is never blocked by audio.
+    audio_enabled: bool = os.environ.get("PROCTOR_AUDIO", "1") != "0"
+    # Optional explicit capture device. Empty = auto-detect the default mic.
+    #   Windows (dshow): the device name, e.g. "Microphone (Realtek Audio)"
+    #   macOS (avfoundation): the audio device index, e.g. "0"
+    #   Linux (pulse): the source name, e.g. "default"
+    audio_device: str = os.environ.get("PROCTOR_AUDIO_DEVICE", "")
+
     # --- Chunking / encoding ---
     chunk_seconds: float = 5.0
     # Chunks are H.264 (required by the server's scalable MPEG-TS merge),

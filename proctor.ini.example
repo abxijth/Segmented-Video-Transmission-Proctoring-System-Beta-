@@ -12,3 +12,10 @@ exam = exam2026
 student = student001
 camera = 0
 chunk_seconds = 5
+
+# Microphone audio is muxed into each chunk by default. Set audio = 0 to record
+# video only. Leave audio_device blank to auto-detect the default mic, or pin a
+# device: Windows = dshow name ("Microphone (Realtek Audio)"), macOS =
+# avfoundation index ("0"), Linux = pulse source ("default").
+audio = 1
+audio_device =

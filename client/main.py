@@ -76,6 +76,11 @@ def resolve_config(argv: list[str] | None = None) -> ClientConfig:
     parser.add_argument("--student", help="student id")
     parser.add_argument("--camera", type=int, help="camera index (default 0)")
     parser.add_argument("--chunk-seconds", type=float, help="chunk length (default 5)")
+    parser.add_argument("--no-audio", action="store_true",
+                        help="record video only (skip microphone capture)")
+    parser.add_argument("--audio-device",
+                        help="mic device override (dshow name / avfoundation "
+                             "index / pulse source)")
     args = parser.parse_args(argv)
 
     ini = _load_ini()
@@ -95,12 +100,28 @@ def resolve_config(argv: list[str] | None = None) -> ClientConfig:
     chunk_seconds = (args.chunk_seconds if args.chunk_seconds is not None
                      else float(ini.get("chunk_seconds", 5.0)))
 
+    # Audio on by default; --no-audio, PROCTOR_AUDIO=0, or `audio = 0` in the
+    # ini turns it off. Same CLI > env > ini > default precedence as the rest.
+    if args.no_audio:
+        audio_enabled = False
+    else:
+        env_audio = os.environ.get("PROCTOR_AUDIO")
+        ini_audio = ini.get("audio")
+        audio_enabled = (env_audio if env_audio is not None
+                         else ini_audio if ini_audio is not None
+                         else "1") not in ("0", "false", "no", "off")
+    audio_device = (args.audio_device
+                    or os.environ.get("PROCTOR_AUDIO_DEVICE")
+                    or ini.get("audio_device", ""))
+
     return ClientConfig(
         server_url=server,
         exam_id=exam,
         student_id=student,
         camera_index=camera,
         chunk_seconds=chunk_seconds,
+        audio_enabled=audio_enabled,
+        audio_device=audio_device,
         # Keep the queue beside the app so a packaged exe writes somewhere sane.
         queue_dir=os.environ.get(
             "PROCTOR_QUEUE", os.path.join(_app_dir(), "client_queue")),

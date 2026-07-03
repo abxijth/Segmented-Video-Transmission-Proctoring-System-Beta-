@@ -10,6 +10,7 @@ that platform's executable. PyInstaller does NOT cross-compile.
 """
 
 import os
+import sys
 from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs
 
 # OpenCV ships compiled libraries and submodules PyInstaller must be told about.
@@ -64,6 +65,33 @@ exe = EXE(
     console=True,          # show the status console; students see it working
     disable_windowed_traceback=False,
     target_arch=None,
-    codesign_identity=None,
+    # Ad-hoc sign on macOS ("-"). Apple Silicon KILLS unsigned binaries outright,
+    # so this is required for the arm64 build to run at all. It is NOT Apple
+    # notarization — see build/build_macos.sh / PACKAGING.md for the quarantine
+    # story students still hit on first launch.
+    codesign_identity="-" if sys.platform == "darwin" else None,
     entitlements_file=None,
 )
+
+# On macOS, wrap the executable in a proper .app bundle. The Info.plist below
+# carries NSCameraUsageDescription — without it macOS's TCC denies camera access
+# and every frame comes back empty. The bundle is what we ship inside the .dmg.
+if sys.platform == "darwin":
+    app = BUNDLE(
+        exe,
+        name="ProctorClient.app",
+        icon=None,
+        bundle_identifier="org.amfoss.proctorclient",
+        info_plist={
+            "NSCameraUsageDescription":
+                "Records webcam video for exam proctoring.",
+            "NSMicrophoneUsageDescription":
+                "Records microphone audio for exam proctoring.",
+            "CFBundleShortVersionString": "0.1.1",
+            "CFBundleVersion": "0.1.1",
+            "LSMinimumSystemVersion": "11.0",
+            # Keep it out of the Dock/App Switcher — it runs in the background
+            # under Safe Exam Browser, not as a foreground app.
+            "LSUIElement": True,
+        },
+    )

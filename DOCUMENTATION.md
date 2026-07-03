@@ -278,10 +278,20 @@ produced, used to size the encoder). Usable as a context manager.
   recorder resolves the encoder at startup and fails fast with a clear message
   if none exists. Any of these produces H.264 the server stream-copies into its
   TS accumulator, so the encoder choice is invisible to the server.
+- `detect_audio_input(ffmpeg_bin, override)` picks the OS microphone input
+  (Windows `dshow` device name / macOS `avfoundation` index / Linux `pulse`
+  source), then **probes** it by capturing 0.3 s to null — this both confirms
+  the device exists and forces macOS's mic-permission prompt early. Returns the
+  ffmpeg input args, or `None` (→ record video only) if there's no mic or
+  permission is denied. Cached; resolved once at startup so **every chunk has
+  the same stream layout**, which the server's TS concat requires.
 - `FfmpegChunkWriter` spawns one ffmpeg per chunk (`-f rawvideo` in, the chosen
-  encoder out — `libx264 -preset ultrafast`, or `-b:v 2500k` for openh264 /
-  hardware) and encodes raw BGR frames written to its stdin into an H.264 MP4.
-  `close()` flushes and raises if ffmpeg failed.
+  encoder out — `libx264 -preset veryfast -crf 28`, or `-b:v 1200k` for
+  openh264 / hardware) and encodes raw BGR frames written to its stdin into an
+  H.264 MP4. When an `audio_input` is supplied it opens the mic as a second
+  input and muxes it as **AAC 128k** (`-map 0:v -map 1:a -shortest`), so the
+  chunk ends when the video stdin closes. `close()` flushes and raises if
+  ffmpeg failed.
 
 ### 7.4 `client/recorder.py` — `ChunkRecorder`
 

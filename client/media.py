@@ -74,6 +74,106 @@ def detect_h264_encoder(ffmpeg_bin: str) -> str | None:
     return None
 
 
+# --- microphone / audio capture ---------------------------------------------
+#
+# We let ffmpeg pull audio straight from the OS capture API (no extra Python
+# dependency), in the same subprocess that encodes the video chunk, and mux the
+# two into one MP4. Each OS exposes the mic through a different ffmpeg input
+# format:
+#   Windows -> dshow        (needs the device *name*)
+#   macOS   -> avfoundation (needs the device *index*, ":<n>" = audio only)
+#   Linux   -> pulse        ("default" source)
+# Detection is done once at startup and probed for real (below) so a machine
+# with no mic, or one that denies mic permission, silently records video only.
+
+
+def _default_dshow_audio_name(ffmpeg_bin: str) -> str | None:
+    """First DirectShow audio device name on Windows, or None."""
+    try:
+        proc = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-list_devices", "true",
+             "-f", "dshow", "-i", "dummy"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # ffmpeg prints the device list to stderr; audio lines end in "(audio)".
+    for line in proc.stderr.splitlines():
+        match = re.search(r'"([^"]+)"\s*\(audio\)', line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _default_avfoundation_audio_index(ffmpeg_bin: str) -> str | None:
+    """First AVFoundation audio device index on macOS, or None."""
+    try:
+        proc = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-f", "avfoundation",
+             "-list_devices", "true", "-i", ""],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    in_audio_section = False
+    for line in proc.stderr.splitlines():
+        if "AVFoundation audio devices" in line:
+            in_audio_section = True
+            continue
+        if in_audio_section:
+            match = re.search(r"\[(\d+)\]", line)
+            if match:
+                return match.group(1)
+    return None
+
+
+def _candidate_audio_input(ffmpeg_bin: str,
+                           override: str | None) -> list[str] | None:
+    """ffmpeg input args (format + device) for this OS's default mic, or None.
+
+    `override` forces a specific device (name/index/source per OS). A large
+    `-thread_queue_size` keeps the live capture from stalling while the video
+    pipe is being written.
+    """
+    tq = ["-thread_queue_size", "1024"]
+    if sys.platform == "darwin":
+        index = override or _default_avfoundation_audio_index(ffmpeg_bin)
+        if index is None:
+            index = "0"  # the built-in mic is device 0 on most Macs
+        return ["-f", "avfoundation", *tq, "-i", f":{index}"]
+    if os.name == "nt":
+        name = override or _default_dshow_audio_name(ffmpeg_bin)
+        if not name:
+            return None  # no dshow audio device -> video only
+        return ["-f", "dshow", *tq, "-i", f"audio={name}"]
+    # Linux / other: try PulseAudio's default source.
+    return ["-f", "pulse", *tq, "-i", override or "default"]
+
+
+@lru_cache(maxsize=8)
+def detect_audio_input(ffmpeg_bin: str,
+                       override: str = "") -> tuple[str, ...] | None:
+    """Return ffmpeg mic-input args if audio can actually be captured, else None.
+
+    The candidate device is *probed* by capturing a fraction of a second to
+    null: this validates the device exists AND that permission is granted (on
+    macOS the probe also triggers the one-time mic-permission prompt early,
+    before recording starts). Cached per (ffmpeg, override).
+    """
+    candidate = _candidate_audio_input(ffmpeg_bin, override or None)
+    if candidate is None:
+        return None
+    try:
+        probe = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-loglevel", "error",
+             *candidate, "-t", "0.3", "-f", "null", "-"],
+            capture_output=True, timeout=25,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return tuple(candidate) if probe.returncode == 0 else None
+
+
 def _encoder_output_args(encoder: str) -> list[str]:
     """ffmpeg output flags tuned per encoder (they take different options).
 
@@ -92,22 +192,39 @@ def _encoder_output_args(encoder: str) -> list[str]:
 
 
 class FfmpegChunkWriter:
-    """Encodes raw BGR frames to one H.264 MP4 chunk via ffmpeg's stdin."""
+    """Encodes raw BGR frames to one H.264 MP4 chunk via ffmpeg's stdin.
+
+    If `audio_input` is given (ffmpeg mic-input args from `detect_audio_input`),
+    the mic is opened as a second input and muxed as AAC into the same chunk;
+    `-shortest` ends the chunk when the video (stdin) does. Without it the chunk
+    is video-only (`-an`).
+    """
 
     def __init__(self, path: str, width: int, height: int, fps: int,
-                 ffmpeg_bin: str, encoder: str = "libx264"):
+                 ffmpeg_bin: str, encoder: str = "libx264",
+                 audio_input: tuple[str, ...] | None = None):
         self._path = path
+        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
+        # Input 0: raw BGR video on stdin. A thread queue keeps it from stalling
+        # the live audio capture while we write frames.
+        if audio_input:
+            cmd += ["-thread_queue_size", "1024"]
+        cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24",
+                "-s", f"{width}x{height}", "-r", str(fps), "-i", "-"]
+        # Input 1 (optional): the microphone.
+        if audio_input:
+            cmd += list(audio_input)
+        # Video encode (encoder + flags chosen for this ffmpeg build).
+        cmd += _encoder_output_args(encoder)
+        # Audio: native AAC (always available, even on ffmpeg-free), or none.
+        if audio_input:
+            cmd += ["-c:a", "aac", "-b:a", "128k",
+                    "-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+        else:
+            cmd += ["-an"]
+        cmd += ["-movflags", "+faststart", path]
         self._proc = subprocess.Popen(
-            [
-                ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y",
-                # raw input coming in on stdin
-                "-f", "rawvideo", "-pix_fmt", "bgr24",
-                "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
-                # H.264 output; encoder + its flags chosen for this ffmpeg build
-                *_encoder_output_args(encoder),
-                "-an", "-movflags", "+faststart",
-                path,
-            ],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,

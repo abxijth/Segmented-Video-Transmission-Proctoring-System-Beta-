@@ -24,6 +24,7 @@ from client.config import ClientConfig
 from client.disk_queue import DiskQueue
 from client.media import (
     FfmpegChunkWriter,
+    detect_audio_input,
     detect_h264_encoder,
     find_ffmpeg,
 )
@@ -55,6 +56,19 @@ class ChunkRecorder:
                 "to RPM Fusion's ffmpeg). Elsewhere install an ffmpeg with "
                 "libx264.")
         print(f"[recorder] using H.264 encoder: {self._encoder}")
+
+        # Resolve the microphone once, up front, so every chunk has the SAME
+        # stream layout (the server's TS concat requires that). If audio is off,
+        # there is no working mic, or permission is denied, we record video
+        # only — recording is never blocked by audio.
+        self._audio_input = None
+        if config.audio_enabled:
+            self._audio_input = detect_audio_input(self._ffmpeg_bin,
+                                                   config.audio_device)
+            if self._audio_input is None:
+                print("[recorder] no usable microphone; recording video only")
+            else:
+                print("[recorder] microphone enabled (AAC audio in each chunk)")
 
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="recorder",
@@ -101,7 +115,8 @@ class ChunkRecorder:
         fps = self._config.fps
 
         writer = FfmpegChunkWriter(part_path, width, height, fps,
-                                   self._ffmpeg_bin, self._encoder)
+                                   self._ffmpeg_bin, self._encoder,
+                                   self._audio_input)
 
         target_total = int(round(self._config.chunk_seconds * fps))
         start = time.monotonic()
