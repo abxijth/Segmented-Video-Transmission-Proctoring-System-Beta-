@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from queue import Queue
 
 from client.camera import CameraManager
 from client.config import ClientConfig
@@ -73,6 +74,13 @@ class ChunkRecorder:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="recorder",
                                          daemon=True)
+        # Chunk finalization (ffmpeg flush + publish) runs on its own thread so
+        # the capture loop never blocks between chunks — that gap is what made
+        # playback jump at every chunk boundary once the mic was added, since
+        # closing an audio+video ffmpeg (and its mic) takes noticeably longer.
+        self._finalize_q: Queue = Queue()
+        self._finalize_thread = threading.Thread(
+            target=self._finalize_loop, name="finalizer", daemon=True)
         # Resume after any chunks a previous (possibly crashed) session left in
         # the queue, so we never overwrite not-yet-uploaded chunks.
         leftover = queue.pending()
@@ -80,11 +88,16 @@ class ChunkRecorder:
 
     # --- lifecycle ----------------------------------------------------------
     def start(self) -> None:
+        self._finalize_thread.start()
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
         self._stop.set()
         self._thread.join(timeout=timeout)
+        # Drain any chunks still being finalized before returning, so none is
+        # lost — then let the finalizer thread exit.
+        self._finalize_q.put(None)
+        self._finalize_thread.join(timeout=timeout)
 
     @property
     def chunks_recorded(self) -> int:
@@ -140,13 +153,35 @@ class ChunkRecorder:
 
                 time.sleep(0.002)  # yield; avoids a busy-spin between frames
         finally:
-            writer.close()
+            # Hand the finished writer to the finalizer thread and return
+            # immediately, so the NEXT chunk starts capturing without waiting
+            # for this ffmpeg (and its mic) to flush and close. That wait was
+            # the dead time that made playback jump at each chunk boundary.
+            self._finalize_q.put(
+                (writer, part_path, final_path, frames_written))
 
-        # Publish the chunk to the queue only if it actually has content.
-        if frames_written > 0:
-            os.replace(part_path, final_path)
-        else:
-            _silently_remove(part_path)
+    # --- background finalization --------------------------------------------
+    def _finalize_loop(self) -> None:
+        """Flush and publish finished chunks in order, off the capture path."""
+        while True:
+            item = self._finalize_q.get()
+            try:
+                if item is None:
+                    return
+                writer, part_path, final_path, frames_written = item
+                try:
+                    writer.close()
+                except RuntimeError as exc:
+                    print(f"[recorder] chunk encode failed: {exc}")
+                    _silently_remove(part_path)
+                    continue
+                # Publish to the queue only if the chunk actually has content.
+                if frames_written > 0:
+                    os.replace(part_path, final_path)
+                else:
+                    _silently_remove(part_path)
+            finally:
+                self._finalize_q.task_done()
 
 
 def _silently_remove(path: str) -> None:

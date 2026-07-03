@@ -309,6 +309,11 @@ every `chunk_seconds`. Details:
 - **Write-then-rename**: encodes to a staging name (`.chunk_NNNNNN.mp4`) and
   renames to the final name only when complete, so the uploader never grabs a
   half-written file.
+- **Background finalization**: closing a chunk's ffmpeg (flush + close the mic)
+  runs on a separate finalizer thread, so the capture loop starts the next chunk
+  immediately. Without this the per-chunk close was dead time during which the
+  camera wasn't read, making playback jump at every chunk boundary — very
+  visible once the mic (whose teardown is slower) was added.
 - **Resume after a crash**: numbering continues after any leftover queued
   chunks.
 - **Audio resolved once at startup**: the H.264 encoder *and* the microphone
