@@ -100,8 +100,29 @@ storage/<exam>/<student>/
     chunks/               transient — merged chunks are deleted
     recording.ts          MPEG-TS accumulator (grows during the exam)
     recording.mp4         built on demand from the TS at download time
+    recording_final.mp4   phone-safe re-encode (after finalize; see below)
     metadata.json         status, lastReceived, lastMerged, lastChunkAt, ...
 ```
+
+## Post-exam: make recordings phone-safe
+
+The on-demand `recording.mp4` is a fast stream-copy of the TS accumulator. The
+TS is byte-appended from independently-encoded chunks, so its timeline can carry
+timestamp resets / variable frame rate that some players — **phones especially**
+— render with stutter or wrong (too-fast) playback. After the exam, run the
+finalizer once to re-encode every session into a clean, constant-frame-rate
+`recording_final.mp4` (with audio) that plays correctly everywhere:
+
+```bash
+python tools/finalize_recordings.py                 # whole ./storage tree
+python tools/finalize_recordings.py --jobs 4        # more parallel re-encodes
+python tools/finalize_recordings.py --overwrite     # replace recording.mp4 in place
+python tools/finalize_recordings.py --exam exam2026 --student student001
+```
+
+It regenerates timestamps from scratch (`setpts`), forces CFR, re-syncs audio,
+and adds `+faststart`. Re-encoding is CPU-heavy — it's a deliberate one-time
+batch step, not part of the live pipeline.
 
 ## Configuration
 
