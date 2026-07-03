@@ -120,6 +120,13 @@ Microphone audio is on by default and muxed into each chunk; set `audio = 0`
 written to a `client_queue/` folder **next to the exe**, so chunks survive a
 crash and resume on the next launch.
 
+### Windows: microphone privacy
+
+Audio is captured via DirectShow. Windows 10/11 gates mic access behind a
+privacy switch — turn on **Settings → Privacy & security → Microphone → "Let
+desktop apps access your microphone"**, or the client logs `no usable
+microphone` and records video only.
+
 ### macOS: camera & microphone permission
 
 The macOS build is a `.app` bundle whose `Info.plist` declares

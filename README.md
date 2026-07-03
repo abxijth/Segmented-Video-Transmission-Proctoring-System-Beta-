@@ -21,9 +21,11 @@ no working microphone.
                                             └────────────────────────────────────┘
 ```
 
-See **[DOCUMENTATION.md](DOCUMENTATION.md)** for the full architecture, the
-H.264 + MPEG-TS merge strategy, code walkthrough, API reference, and scaling
-notes. See **[PACKAGING.md](PACKAGING.md)** to build the standalone `.exe`.
+See **[COMMANDS.md](COMMANDS.md)** for every command in one place (run, build,
+finalize). See **[DOCUMENTATION.md](DOCUMENTATION.md)** for the full
+architecture, the H.264 + MPEG-TS merge strategy, code walkthrough, API
+reference, and scaling notes. See **[PACKAGING.md](PACKAGING.md)** to build the
+standalone `.exe`/`.app`.
 
 ## Layout
 
