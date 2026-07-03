@@ -35,10 +35,12 @@ wire protocol, and how to set it up, run it, and package it.
 
 ## 1. What it does
 
-- **Client** (student laptop): captures the webcam, encodes **H.264** MP4 chunks
-  (~5 s each) via ffmpeg, and queues them on disk. A background uploader sends
-  each chunk to the server over HTTP and deletes the local copy only after the
-  server confirms receipt.
+- **Client** (student laptop): captures the webcam **and microphone**, encodes
+  **H.264 video + AAC audio** MP4 chunks (~5 s each) via ffmpeg, and queues them
+  on disk. A background uploader sends each chunk to the server over HTTP and
+  deletes the local copy only after the server confirms receipt. Audio is
+  detected once at startup and falls back to **video-only** if no working mic is
+  present.
 - **Server** (proctor laptop): authenticates each upload and stores the chunk.
   A background worker incrementally merges chunks into a per-student recording
   and deletes the merged chunks. The final `recording.mp4` is produced on
@@ -258,7 +260,9 @@ Pipeline: **camera → recorder (ffmpeg H.264) → disk queue → uploader → s
 Dataclass of all tunables (all have defaults, so a bare exe runs). Notable:
 `server_url` defaults to the baked-in `DEFAULT_SERVER_URL`; `ffmpeg_bin`
 (override the ffmpeg path, else auto-discover); `fps`, `chunk_seconds`,
-`queue_dir`, retry backoff. `session_queue_dir` isolates each session's chunks.
+`queue_dir`, retry backoff. `audio_enabled` (mux mic audio, default on) and
+`audio_device` (optional mic override, else auto-detect). `session_queue_dir`
+isolates each session's chunks.
 
 ### 7.2 `client/camera.py` — `CameraManager`
 
@@ -307,6 +311,10 @@ every `chunk_seconds`. Details:
   half-written file.
 - **Resume after a crash**: numbering continues after any leftover queued
   chunks.
+- **Audio resolved once at startup**: the H.264 encoder *and* the microphone
+  (`detect_audio_input`) are picked before recording, so every chunk shares one
+  stream layout — H.264(+AAC) or video-only — which the server's TS concat
+  requires. No mic / denied permission → video only, logged but never fatal.
 - Raises a clear error at startup if **ffmpeg isn't found**.
 
 ### 7.5 `client/disk_queue.py` — `DiskQueue`
@@ -325,9 +333,11 @@ recovery. `drain_and_stop()` flushes the queue at shutdown.
 ### 7.7 `client/main.py` — entry & settings
 
 `resolve_config()` gathers settings from CLI > env > `proctor.ini` (next to the
-exe) > interactive prompts (so a double-clicked exe works). `run(config)` opens
-the camera, starts the recorder + uploader threads, prints a status line until
-`Ctrl+C`, then finalizes.
+exe) > baked defaults — nothing prompts, so a double-clicked / SEB-launched exe
+runs hands-off (an unset student id falls back to the machine hostname). Audio
+flags (`--no-audio`, `--audio-device`) follow the same precedence. `run(config)`
+opens the camera, starts the recorder + uploader threads, prints a status line
+until `Ctrl+C`, then finalizes.
 
 ---
 
@@ -526,6 +536,8 @@ finalized (or the worker finalizes it as stale).
 | resolution | `1280x720` | — |
 | fps | `30` | — |
 | ffmpeg path | auto-discover | `PROCTOR_FFMPEG` |
+| audio | on (mic → AAC 128k) | `PROCTOR_AUDIO=0` (`--no-audio`) |
+| audio device | auto-detect default mic | `PROCTOR_AUDIO_DEVICE` (`--audio-device`) |
 | queue dir | beside app / `./client_queue` | `PROCTOR_QUEUE` |
 | auth token | shared secret | `PROCTOR_TOKEN` |
 

@@ -1,16 +1,18 @@
 # SEB Webcam Proctoring
 
-A resilient webcam recording system. The **client** records the webcam into
-short **H.264** chunks and uploads them over HTTP to a **server** running on
-another laptop. The server stores every chunk and a **background worker** merges
-them into one recording per student — and auto-finalizes even if the client
-disconnects. Chunks queue on disk and retry until acknowledged, so a network
-drop never loses footage.
+A resilient webcam recording system. The **client** records the webcam **and
+microphone** into short **H.264 + AAC** chunks and uploads them over HTTP to a
+**server** running on another laptop. The server stores every chunk and a
+**background worker** merges them into one recording per student — and
+auto-finalizes even if the client disconnects. Chunks queue on disk and retry
+until acknowledged, so a network drop never loses footage. Audio is muxed into
+each chunk and detected once at startup, falling back to video-only if there is
+no working microphone.
 
 ```
  STUDENT LAPTOP                              PROCTOR LAPTOP / SERVER
 ┌────────────────────────────┐   HTTP POST  ┌────────────────────────────────────┐
-│ camera → ffmpeg (H.264)    │ ───────────► │ FastAPI: store chunk, return fast  │
+│ cam+mic → ffmpeg (H.264+AAC)│ ──────────► │ FastAPI: store chunk, return fast  │
 │  → disk queue → uploader   │ ◄─────────── │            │                       │
 └────────────────────────────┘     ACK      │   MergeWorker (background thread)  │
                                             │   chunks → recording.ts (append)  │
@@ -27,15 +29,16 @@ notes. See **[PACKAGING.md](PACKAGING.md)** to build the standalone `.exe`.
 
 ```
 shared/      wire contract shared by client & server (chunk naming, headers, metadata)
-client/      camera capture, H.264 chunking (ffmpeg), disk queue, upload-with-retry
+client/      camera + mic capture, H.264+AAC chunking (ffmpeg), disk queue, upload-with-retry
 server/      FastAPI app, chunk storage, MergeWorker, TS-based merger
 ```
 
 ## Requirements
 
 - Python 3.10+
-- **ffmpeg on PATH** — client uses it to encode H.264, server to merge
-- A webcam on the client laptop
+- **ffmpeg on PATH** — client uses it to encode H.264 + capture mic audio,
+  server to merge
+- A webcam (and, for audio, a microphone) on the client laptop
 
 ```bash
 python3 -m venv .venv
@@ -105,8 +108,9 @@ storage/<exam>/<student>/
 | Setting        | Where                         | Default                     |
 |----------------|-------------------------------|-----------------------------|
 | Server URL     | `--server` / `PROCTOR_SERVER` / `proctor.ini` / baked default | `client/config.py` |
-| Exam / student | `--exam` / `--student` (prompted if unset) | `exam2026` / prompt |
+| Exam / student | `--exam` / `--student` (else hostname) | `exam2026` / hostname |
 | Chunk length   | `--chunk-seconds`             | `5`                         |
+| Audio          | `--no-audio` / `PROCTOR_AUDIO=0` · device: `--audio-device` / `PROCTOR_AUDIO_DEVICE` | on (mic → AAC) |
 | Auth token     | `PROCTOR_TOKEN` (both sides)  | `prototype-shared-secret`   |
 | Storage root   | `PROCTOR_STORAGE` (server)    | `./storage`                 |
 | Merge interval | `PROCTOR_MERGE_INTERVAL` (server) | `10` s                  |

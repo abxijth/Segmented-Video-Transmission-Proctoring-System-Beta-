@@ -8,9 +8,12 @@ It answers the operational questions that code alone doesn't: where student
 identity comes from, how the client is distributed, how SEB launches and
 force-quits it, and what infrastructure and legal groundwork is required.
 
-> The recording pipeline itself (H.264 chunks → disk queue → upload → server-side
-> MergeWorker → `recording.ts` → `recording.mp4`) **does not change**. See
-> [DOCUMENTATION.md](DOCUMENTATION.md). Only the surrounding deployment does.
+> The recording pipeline itself (H.264+AAC chunks → disk queue → upload →
+> server-side MergeWorker → `recording.ts` → `recording.mp4`) **does not
+> change**. Chunks now carry microphone audio (muxed as AAC; falls back to
+> video-only if there's no mic) — the server merge is untouched since MPEG-TS
+> carries H.264+AAC natively. See [DOCUMENTATION.md](DOCUMENTATION.md). Only the
+> surrounding deployment does.
 
 ---
 
@@ -100,7 +103,9 @@ invisibly under SEB (the spec is currently `console=True`).
   is far lighter than 720p. Rough budget: **~1 GB per contestant for a 3-hour
   exam** at a modest bitrate → **~300 GB for 300 contestants**, with peak ingress
   of a few hundred Mbit/s. **Lower the default resolution/fps/bitrate** for
-  online — a proctoring face-cam does not need 720p30.
+  online — a proctoring face-cam does not need 720p30. **Audio adds ~128 kbps**
+  per contestant (small next to video, but factor it into the storage budget;
+  `--no-audio` drops it entirely if audio isn't needed).
 
 ---
 

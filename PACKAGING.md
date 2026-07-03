@@ -7,9 +7,10 @@ student's machine. The bundle includes the Python runtime, OpenCV, NumPy, and
 
 ## ffmpeg is bundled automatically — students install nothing
 
-The client encodes H.264 chunks with **ffmpeg**, so it must travel *inside* the
-exe. **The build handles this for you** — you do not download or install ffmpeg
-manually, and neither do the students:
+The client encodes H.264 video (and captures **microphone audio**, muxed as
+AAC) with **ffmpeg**, so it must travel *inside* the exe. **The build handles
+this for you** — you do not download or install ffmpeg manually, and neither do
+the students:
 
 - `build\build_windows.bat` / `build/build_linux.sh` run a fetch step
   (`build/fetch_ffmpeg.ps1` / `build/fetch_ffmpeg.sh`) that downloads a **static
@@ -98,22 +99,35 @@ The exe resolves its settings from, in priority order:
    `ProctorClient.exe --server http://192.168.1.50:8000 --exam exam2026 --student student001`
 2. **environment variables** — `PROCTOR_SERVER`, `PROCTOR_EXAM`, `PROCTOR_STUDENT`
 3. **`proctor.ini`** placed next to the exe (copy `proctor.ini.example`)
-4. **interactive prompts** — just double-click; it asks for anything missing.
+4. **baked defaults** — nothing prompts; just double-click. An unset student id
+   falls back to the machine hostname, so it always runs unattended.
 
 A typical classroom setup: ship the exe with a `proctor.ini` that pins
-`server` and `exam`, and let each student type only their own student ID at the
-prompt.
+`server`, `exam`, and each contestant's `student` id.
 
 ```ini
 [client]
 server = http://192.168.1.50:8000
 exam = exam2026
+student = student001
 camera = 0
 chunk_seconds = 5
+audio = 1          ; mic audio (AAC) into every chunk; set 0 for video only
 ```
 
-The recording queue is written to a `client_queue/` folder **next to the exe**,
-so chunks survive a crash and resume on the next launch.
+Microphone audio is on by default and muxed into each chunk; set `audio = 0`
+(or `--no-audio` / `PROCTOR_AUDIO=0`) for video-only. The recording queue is
+written to a `client_queue/` folder **next to the exe**, so chunks survive a
+crash and resume on the next launch.
+
+### macOS: camera & microphone permission
+
+The macOS build is a `.app` bundle whose `Info.plist` declares
+`NSCameraUsageDescription` and `NSMicrophoneUsageDescription` — **required**, or
+macOS silently denies capture. On first launch the OS prompts the user to grant
+camera and mic access; the audio probe at startup triggers the mic prompt early.
+Because the app is only ad-hoc signed (not Apple-notarized), the user must also
+clear Gatekeeper once — see the Gatekeeper note in the distribution checklist.
 
 ## Distribution checklist
 
