@@ -64,12 +64,12 @@ class ChunkRecorder:
         # only — recording is never blocked by audio.
         self._audio_input = None
         if config.audio_enabled:
+            # detect_audio_input() prints the authoritative [audio] status
+            # (which device, measured level, or a silent-mic warning).
             self._audio_input = detect_audio_input(self._ffmpeg_bin,
                                                    config.audio_device)
             if self._audio_input is None:
                 print("[recorder] no usable microphone; recording video only")
-            else:
-                print("[recorder] microphone enabled (AAC audio in each chunk)")
 
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="recorder",

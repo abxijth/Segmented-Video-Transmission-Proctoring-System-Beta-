@@ -235,6 +235,17 @@ curl http://<SERVER_IP>:8000/health
 # does a chunk / recording actually contain audio?
 ffprobe -v error -show_entries stream=codec_type,codec_name -of default=nw=1 <file>
 
+# is the audio SILENT? (mean/max ~ -84..-91 dB = digital silence, mic captured nothing)
+ffmpeg -i <file> -af volumedetect -f null -
+
+# audio present but silent -> the mic opened but captured nothing. Fix by device:
+#   macOS   : System Settings > Privacy & Security > Microphone > enable the app
+#   Windows : Settings > Privacy > Microphone > allow desktop apps; unmute
+#   Linux   : default source may be a monitor/muted -> pick a real input:
+pactl list sources short           # find a non-.monitor source name
+python -m client.main --audio-device <source-name> ...   # Linux
+#   (Windows: --audio-device "Microphone (Realtek Audio)"; macOS: --audio-device 0)
+
 # find your LAN IP
 ip -4 addr            # Linux
 ipconfig              # Windows

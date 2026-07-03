@@ -284,11 +284,16 @@ produced, used to size the encoder). Usable as a context manager.
   TS accumulator, so the encoder choice is invisible to the server.
 - `detect_audio_input(ffmpeg_bin, override)` picks the OS microphone input
   (Windows `dshow` device name / macOS `avfoundation` index / Linux `pulse`
-  source), then **probes** it by capturing 0.3 s to null — this both confirms
-  the device exists and forces macOS's mic-permission prompt early. Returns the
-  ffmpeg input args, or `None` (→ record video only) if there's no mic or
-  permission is denied. Cached; resolved once at startup so **every chunk has
-  the same stream layout**, which the server's TS concat requires.
+  source), then **measures the captured level** (`volumedetect` over ~0.7 s) —
+  not just "does it open". This catches a device that opens but yields **digital
+  silence** (denied permission, a muted input, or a `default` source pointing at
+  an output monitor), which the old open-only probe accepted and recorded as a
+  silent track. On silence: Linux hunts the real (non-monitor) `pactl` sources
+  for one with signal; otherwise it prints a loud OS-specific fix and keeps
+  recording (so unmuting/granting permission mid-session starts capturing).
+  Returns the ffmpeg input args, or `None` (→ video only) if nothing opens.
+  Cached; resolved once at startup so **every chunk has the same stream
+  layout**, which the server's TS concat requires.
 - `FfmpegChunkWriter` spawns one ffmpeg per chunk (`-f rawvideo` in, the chosen
   encoder out — `libx264 -preset veryfast -crf 28`, or `-b:v 1200k` for
   openh264 / hardware) and encodes raw BGR frames written to its stdin into an

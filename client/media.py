@@ -82,9 +82,11 @@ def detect_h264_encoder(ffmpeg_bin: str) -> str | None:
 # format:
 #   Windows -> dshow        (needs the device *name*)
 #   macOS   -> avfoundation (needs the device *index*, ":<n>" = audio only)
-#   Linux   -> pulse        ("default" source)
-# Detection is done once at startup and probed for real (below) so a machine
-# with no mic, or one that denies mic permission, silently records video only.
+#   Linux   -> pulse        ("default" source, or a real input we pick)
+# Detection is done once at startup and the captured LEVEL is measured (below),
+# so a machine with no mic records video only, and a device that opens but
+# yields digital silence (denied permission / muted / a monitor source) is
+# caught instead of quietly recording a silent track.
 
 
 def _default_dshow_audio_name(ffmpeg_bin: str) -> str | None:
@@ -150,28 +152,117 @@ def _candidate_audio_input(ffmpeg_bin: str,
     return ["-f", "pulse", *tq, "-i", override or "default"]
 
 
+# Peak level (dBFS) below this is treated as digital silence — i.e. the device
+# opened but is capturing nothing (denied mic permission, a muted input, or the
+# "default" source pointing at an output monitor). A live mic, even in a quiet
+# room, sits well above this; pure silence reads around -84..-91 dB.
+_SILENCE_DBFS = -80.0
+
+
+def _measure_audio_dbfs(ffmpeg_bin: str, input_args: list[str],
+                        seconds: float = 0.7) -> float | None:
+    """Peak dBFS captured from `input_args` over `seconds`, or None if the
+    device could not be opened / captured at all."""
+    try:
+        # No `-loglevel error` here: volumedetect reports at info level.
+        proc = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", *input_args,
+             "-t", str(seconds), "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=25,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    match = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?) dB", proc.stderr)
+    return float(match.group(1)) if match else None
+
+
+def _pulse_input_sources() -> list[str]:
+    """Real (non-monitor) PulseAudio/PipeWire capture sources, best-effort."""
+    try:
+        proc = subprocess.run(["pactl", "list", "sources", "short"],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    names = []
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t")
+        # columns: index, name, driver, ... — skip .monitor (loopback of output)
+        if len(parts) >= 2 and not parts[1].endswith(".monitor"):
+            names.append(parts[1])
+    return names
+
+
+def _describe_audio_input(input_args: tuple[str, ...] | list[str]) -> str:
+    """Human label for a mic-input arg list, e.g. 'pulse:default'."""
+    fmt = input_args[input_args.index("-f") + 1] if "-f" in input_args else "?"
+    dev = input_args[-1]
+    return f"{fmt}:{dev}"
+
+
+def _warn_silent_mic(input_args: list[str], level: float | None) -> None:
+    lvl = "no signal" if level is None else f"peak {level:.0f} dBFS"
+    print("\n" + "!" * 70)
+    print(f"[audio] WARNING: microphone opened but is SILENT ({lvl}) — "
+          f"{_describe_audio_input(input_args)}")
+    if sys.platform == "darwin":
+        print("[audio] Grant mic access: System Settings > Privacy & Security >")
+        print("[audio] Microphone > enable this app, then relaunch. (Or the")
+        print("[audio] wrong input is selected.)")
+    elif os.name == "nt":
+        print("[audio] Check: Settings > Privacy > Microphone > allow desktop")
+        print("[audio] apps; unmute the mic; or pass --audio-device \"<name>\".")
+    else:
+        print("[audio] The default source may be a monitor or muted. Unmute it,")
+        print("[audio] or pass --audio-device <source> (list: "
+              "`pactl list sources short`).")
+    print("[audio] Recording continues; fix and it starts capturing sound.")
+    print("!" * 70 + "\n")
+
+
 @lru_cache(maxsize=8)
 def detect_audio_input(ffmpeg_bin: str,
                        override: str = "") -> tuple[str, ...] | None:
-    """Return ffmpeg mic-input args if audio can actually be captured, else None.
+    """Return ffmpeg mic-input args if audio can be captured, else None.
 
-    The candidate device is *probed* by capturing a fraction of a second to
-    null: this validates the device exists AND that permission is granted (on
-    macOS the probe also triggers the one-time mic-permission prompt early,
-    before recording starts). Cached per (ffmpeg, override).
+    Beyond "does the device open", this MEASURES the captured level so a device
+    that opens but yields digital silence (denied permission, muted input, or a
+    default source pointing at an output monitor) is caught — the earlier
+    open-only probe accepted those and recorded a silent track. On macOS the
+    probe also triggers the one-time mic-permission prompt early. Cached per
+    (ffmpeg, override).
     """
     candidate = _candidate_audio_input(ffmpeg_bin, override or None)
     if candidate is None:
         return None
-    try:
-        probe = subprocess.run(
-            [ffmpeg_bin, "-hide_banner", "-loglevel", "error",
-             *candidate, "-t", "0.3", "-f", "null", "-"],
-            capture_output=True, timeout=25,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return tuple(candidate) if probe.returncode == 0 else None
+
+    level = _measure_audio_dbfs(ffmpeg_bin, candidate)
+    if level is None:
+        return None  # could not open/capture at all -> record video only
+
+    if level > _SILENCE_DBFS:
+        print(f"[audio] microphone OK — {_describe_audio_input(candidate)} "
+              f"(peak {level:.0f} dBFS)")
+        return tuple(candidate)
+
+    # Opened but silent. On Linux the culprit is usually the wrong default
+    # source; try each real input and keep the first one that has signal.
+    if not override and sys.platform != "darwin" and os.name != "nt":
+        for src in _pulse_input_sources():
+            if src == candidate[-1]:
+                continue
+            alt = ["-f", "pulse", "-thread_queue_size", "1024", "-i", src]
+            alt_level = _measure_audio_dbfs(ffmpeg_bin, alt)
+            if alt_level is not None and alt_level > _SILENCE_DBFS:
+                print(f"[audio] default source was silent; using '{src}' "
+                      f"(peak {alt_level:.0f} dBFS)")
+                return tuple(alt)
+
+    # No source with signal found — warn loudly but keep recording, so if the
+    # user unmutes / grants permission mid-session sound starts flowing.
+    _warn_silent_mic(candidate, level)
+    return tuple(candidate)
 
 
 def _encoder_output_args(encoder: str) -> list[str]:
