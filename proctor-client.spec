@@ -1,10 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec for the proctoring client.
 
-Builds a single self-contained executable (Windows: ProctorClient.exe) that
-bundles the Python runtime and every dependency (OpenCV, NumPy, requests).
-The SAME spec works on Windows, Linux, and macOS — run it on each OS to get
-that platform's executable. PyInstaller does NOT cross-compile.
+Bundles the Python runtime and every dependency (OpenCV, NumPy, requests, plus
+vendored ffmpeg). Output per OS:
+  * Windows / Linux -> a single self-contained executable (ProctorClient[.exe])
+  * macOS           -> a onedir ProctorClient.app bundle (NOT onefile — see the
+                       macOS section below for why: onefile breaks Apple-Silicon
+                       library validation)
+The SAME spec works on all three — run it on each OS. PyInstaller does NOT
+cross-compile.
 
     pyinstaller proctor-client.spec
 """
@@ -49,36 +53,44 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name="ProctorClient",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=True,          # show the status console; students see it working
-    disable_windowed_traceback=False,
-    target_arch=None,
-    # Ad-hoc sign on macOS ("-"). Apple Silicon KILLS unsigned binaries outright,
-    # so this is required for the arm64 build to run at all. It is NOT Apple
-    # notarization — see build/build_macos.sh / PACKAGING.md for the quarantine
-    # story students still hit on first launch.
-    codesign_identity="-" if sys.platform == "darwin" else None,
-    entitlements_file=None,
-)
-
-# On macOS, wrap the executable in a proper .app bundle. The Info.plist below
-# carries NSCameraUsageDescription — without it macOS's TCC denies camera access
-# and every frame comes back empty. The bundle is what we ship inside the .dmg.
 if sys.platform == "darwin":
-    app = BUNDLE(
+    # --- macOS: onedir + .app bundle -----------------------------------------
+    # A onefile build seals Python.framework (signed by python.org) inside the
+    # archive; at launch it's extracted and loaded into our ad-hoc-signed
+    # bootloader, and Apple-Silicon *library validation* refuses the cross-Team
+    # load ("different Team IDs"). onedir puts every dylib/framework on disk as a
+    # real file, so a single deep ad-hoc re-sign (see the CI / build_macos.sh
+    # `codesign --deep` step) gives the whole bundle ONE consistent signature and
+    # the mismatch disappears. Do NOT switch this back to onefile.
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,          # onedir: binaries go into COLLECT below
+        name="ProctorClient",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=True,
+        upx_exclude=[],
+        console=True,
+        disable_windowed_traceback=False,
+        target_arch=None,
+        codesign_identity="-",          # ad-hoc; CI re-signs the .app --deep
+        entitlements_file=None,
+    )
+    coll = COLLECT(
         exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=True,
+        upx_exclude=[],
+        name="ProctorClient",
+    )
+    # The Info.plist camera/mic keys are REQUIRED or macOS TCC denies capture.
+    app = BUNDLE(
+        coll,
         name="ProctorClient.app",
         icon=None,
         bundle_identifier="org.amfoss.proctorclient",
@@ -94,4 +106,25 @@ if sys.platform == "darwin":
             # under Safe Exam Browser, not as a foreground app.
             "LSUIElement": True,
         },
+    )
+else:
+    # --- Windows / Linux: single self-contained executable -------------------
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.datas,
+        [],
+        name="ProctorClient",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=True,
+        upx_exclude=[],
+        runtime_tmpdir=None,
+        console=True,      # show the status console; students see it working
+        disable_windowed_traceback=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
     )

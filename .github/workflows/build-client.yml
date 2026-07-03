@@ -47,6 +47,19 @@ jobs:
       - name: Build executable
         run: pyinstaller --clean --noconfirm proctor-client.spec
 
+      # macOS onedir .app: deep ad-hoc re-sign so the bootloader and the bundled
+      # python.org framework share ONE signature (fixes the Apple-Silicon
+      # "different Team IDs" library-validation crash), then package with ditto
+      # which preserves the framework symlinks + executable bits that
+      # upload-artifact's plain zip would otherwise break.
+      - name: Sign & package macOS app
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --deep --sign - dist/ProctorClient.app
+          codesign --verify --deep --strict --verbose=2 dist/ProctorClient.app
+          ditto -c -k --keepParent dist/ProctorClient.app dist/ProctorClient-macos.zip
+          rm -rf dist/ProctorClient dist/ProctorClient.app
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
