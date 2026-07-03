@@ -38,12 +38,20 @@ from client.uploader import UploadManager
 def _app_dir() -> str:
     """Directory to look beside for proctor.ini / write the queue into.
 
-    When frozen by PyInstaller this is the folder containing the .exe; from
-    source it is the current working directory.
+    When frozen by PyInstaller this is the folder containing the executable;
+    from source it is the current working directory. On macOS the executable
+    lives deep inside `ProctorClient.app/Contents/MacOS/ProctorClient`, so we
+    climb out of the bundle to the folder that CONTAINS the .app — that's where
+    a `proctor.ini` sits beside the app icon and where the queue can actually be
+    written (writing inside the bundle is hidden and often read-only).
     """
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.getcwd()
+    if not getattr(sys, "frozen", False):
+        return os.getcwd()
+    exe_dir = os.path.dirname(sys.executable)
+    if sys.platform == "darwin" and ".app/Contents/MacOS" in sys.executable:
+        # .../X.app/Contents/MacOS -> .../  (the folder holding X.app)
+        return os.path.dirname(os.path.dirname(os.path.dirname(exe_dir)))
+    return exe_dir
 
 
 def _load_ini() -> dict:

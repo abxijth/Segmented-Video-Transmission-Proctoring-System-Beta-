@@ -99,6 +99,11 @@ if sys.platform == "darwin":
                 "Records webcam video for exam proctoring.",
             "NSMicrophoneUsageDescription":
                 "Records microphone audio for exam proctoring.",
+            # Uploads go to the proctor server, often on the LAN (10.x/192.168).
+            # macOS Sequoia gates LAN access behind Local Network permission;
+            # this description shows in that prompt / Settings toggle.
+            "NSLocalNetworkUsageDescription":
+                "Uploads exam recordings to the proctoring server.",
             "CFBundleShortVersionString": "0.1.1",
             "CFBundleVersion": "0.1.1",
             "LSMinimumSystemVersion": "11.0",
