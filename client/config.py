@@ -26,6 +26,12 @@ class ClientConfig:
     student_id: str = "student001"
     auth_token: str = os.environ.get("PROCTOR_TOKEN", DEFAULT_AUTH_TOKEN)
 
+    # --- Local Login Server ---
+    local_server_port: int = 23456
+    wait_for_login: bool = True
+    custom_metadata: dict | None = None
+
+
     # --- Camera ---
     camera_index: int = 0
     frame_width: int = 1280

@@ -77,6 +77,7 @@ def upload_chunk(
     student_id: str = Path(...),
     chunk: UploadFile = File(..., alias=UPLOAD_FILE_FIELD),
     x_chunk_sequence: int = Header(..., alias=HEADER_SEQUENCE),
+    x_session_metadata: str | None = Header(default=None, alias="X-Session-Metadata"),
 ):
     if x_chunk_sequence < 0:
         raise HTTPException(status_code=400, detail="sequence must be >= 0")
@@ -98,6 +99,16 @@ def upload_chunk(
             return JSONResponse(status_code=409,
                                 content={"status": "duplicate",
                                          "sequence": x_chunk_sequence})
+
+        # Merge custom metadata if provided
+        if x_session_metadata:
+            try:
+                import json
+                custom_meta = json.loads(x_session_metadata)
+                if isinstance(custom_meta, dict):
+                    meta.setdefault("custom", {}).update(custom_meta)
+            except Exception as e:
+                print(f"[server] Error parsing custom metadata header: {e}")
 
         store.save_chunk(x_chunk_sequence, data)
         meta["lastReceived"] = max(meta["lastReceived"], x_chunk_sequence)
