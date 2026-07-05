@@ -33,6 +33,10 @@ class UploadManager:
             f"/exams/{config.exam_id}/{config.student_id}/chunks"
         )
         self._headers = {HEADER_AUTH: f"{AUTH_SCHEME} {config.auth_token}"}
+        if getattr(config, "custom_metadata", None):
+            import json
+            self._headers["X-Session-Metadata"] = json.dumps(config.custom_metadata)
+
 
         self._stop = threading.Event()
         self._drained = threading.Event()

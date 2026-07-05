@@ -89,6 +89,10 @@ def resolve_config(argv: list[str] | None = None) -> ClientConfig:
     parser.add_argument("--audio-device",
                         help="mic device override (dshow name / avfoundation "
                              "index / pulse source)")
+    parser.add_argument("--local-port", type=int,
+                        help="port for local HTTP server (default 23456)")
+    parser.add_argument("--wait-for-login", action="store_true", default=None,
+                        help="wait for student login via SEB page before recording")
     args = parser.parse_args(argv)
 
     ini = _load_ini()
@@ -101,8 +105,8 @@ def resolve_config(argv: list[str] | None = None) -> ClientConfig:
     # Nothing here ever prompts or blocks.
     server = pick(args.server, "PROCTOR_SERVER", "server") or DEFAULT_SERVER_URL
     exam = pick(args.exam, "PROCTOR_EXAM", "exam") or "exam2026"
-    student = (pick(args.student, "PROCTOR_STUDENT", "student")
-               or _default_student_id())
+    cli_student = pick(args.student, "PROCTOR_STUDENT", "student")
+    student = cli_student or _default_student_id()
 
     camera = args.camera if args.camera is not None else int(ini.get("camera", 0))
     chunk_seconds = (args.chunk_seconds if args.chunk_seconds is not None
@@ -122,6 +126,20 @@ def resolve_config(argv: list[str] | None = None) -> ClientConfig:
                     or os.environ.get("PROCTOR_AUDIO_DEVICE")
                     or ini.get("audio_device", ""))
 
+    local_port = args.local_port if args.local_port is not None else int(ini.get("local_port", 23456))
+
+    # wait_for_login: CLI argument > env var > proctor.ini > default (True if no student specified, otherwise False)
+    env_wait = os.environ.get("PROCTOR_WAIT_FOR_LOGIN")
+    ini_wait = ini.get("wait_for_login")
+    if args.wait_for_login is not None:
+        wait_for_login = args.wait_for_login
+    elif env_wait is not None:
+        wait_for_login = env_wait not in ("0", "false", "no", "off")
+    elif ini_wait is not None:
+        wait_for_login = ini_wait not in ("0", "false", "no", "off")
+    else:
+        wait_for_login = cli_student is None
+
     return ClientConfig(
         server_url=server,
         exam_id=exam,
@@ -130,6 +148,8 @@ def resolve_config(argv: list[str] | None = None) -> ClientConfig:
         chunk_seconds=chunk_seconds,
         audio_enabled=audio_enabled,
         audio_device=audio_device,
+        local_server_port=local_port,
+        wait_for_login=wait_for_login,
         # Keep the queue beside the app so a packaged exe writes somewhere sane.
         queue_dir=os.environ.get(
             "PROCTOR_QUEUE", os.path.join(_app_dir(), "client_queue")),
@@ -181,10 +201,39 @@ def main() -> int:
         print("\n[client] cancelled.")
         return 1
 
+    local_server = None
+    if config.wait_for_login or config.local_server_port:
+        from client.local_server import start_local_server
+        try:
+            local_server = start_local_server(config.local_server_port)
+        except Exception as exc:
+            print(f"\n[client] warning: local server failed to start: {exc}")
+            if config.wait_for_login:
+                print("[client] error: local server required for login but failed to start.")
+                if getattr(sys, "frozen", False) and sys.stdin and sys.stdin.isatty():
+                    input("Press Enter to close...")
+                return 1
+
+    if config.wait_for_login and local_server:
+        print("[client] Waiting for login from Safe Exam Browser...")
+        try:
+            while not local_server.login_event.wait(timeout=1.0):
+                # Yield so Ctrl+C is caught cleanly
+                pass
+        except KeyboardInterrupt:
+            print("\n[client] cancelled.")
+            return 1
+        
+        login_data = local_server.login_data
+        if login_data:
+            config.student_id = login_data["username"]
+            if login_data["exam_id"]:
+                config.exam_id = login_data["exam_id"]
+            config.custom_metadata = login_data["metadata"]
+
     try:
         return run(config)
     except RuntimeError as exc:
-        # e.g. camera could not be opened — show it and (for double-click) hold.
         print(f"\n[client] error: {exc}")
         if getattr(sys, "frozen", False) and sys.stdin and sys.stdin.isatty():
             input("Press Enter to close...")
@@ -193,3 +242,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
+

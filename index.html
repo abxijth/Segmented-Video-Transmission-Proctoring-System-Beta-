@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login Form</title>
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: Arial, sans-serif;
+        }
+
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background: #f2f2f2;
+        }
+
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.15);
+            width: 350px;
+        }
+
+        h2 {
+            text-align: center;
+            margin-bottom: 25px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: bold;
+        }
+
+        input {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 18px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            font-size: 15px;
+        }
+
+        button {
+            width: 100%;
+            padding: 12px;
+            background: #007BFF;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #0056b3;
+        }
+
+        button:disabled {
+            background: #a0a0a0;
+            cursor: not-allowed;
+        }
+
+        .error-msg {
+            color: #d9534f;
+            font-size: 14px;
+            margin-bottom: 15px;
+            display: none;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Login</h2>
+    <div id="errorMsg" class="error-msg"></div>
+
+    <form id="loginForm">
+        <label for="username">Username</label>
+        <input
+            type="text"
+            id="username"
+            name="username"
+            placeholder="Enter username"
+            required
+        >
+
+        <label for="password">Password</label>
+        <input
+            type="password"
+            id="password"
+            name="password"
+            placeholder="Enter password"
+            required
+        >
+
+        <button type="submit" id="submitBtn">Submit</button>
+    </form>
+</div>
+
+<script>
+document.getElementById("loginForm").addEventListener("submit", function(e) {
+    e.preventDefault();
+
+    const usernameInput = document.getElementById("username");
+    const passwordInput = document.getElementById("password");
+    const submitBtn = document.getElementById("submitBtn");
+    const errorMsg = document.getElementById("errorMsg");
+
+    const username = usernameInput.value.trim();
+    const password = passwordInput.value.trim();
+
+    if (!username || !password) {
+        errorMsg.textContent = "Please fill in all fields.";
+        errorMsg.style.display = "block";
+        return;
+    }
+
+    // Disable input/button during request to prevent double submissions
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Connecting to proctoring service...";
+    errorMsg.style.display = "none";
+
+    // Prepare student payload
+    const payload = {
+        username: username,
+        // We can pass exam_id dynamically if needed, or omit to let the client default
+        exam_id: "exam2026", 
+        // Pass other credentials or browser/session info in the metadata
+        password: password,
+        login_timestamp: new Date().toISOString(),
+        user_agent: navigator.userAgent
+    };
+
+    // Send credentials to local proctoring recorder server running in background
+    fetch("http://127.0.0.1:23456/login", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+    })
+    .then(response => {
+        if (!response.ok) {
+            return response.json().then(err => { throw new Error(err.error || "Failed login verification"); });
+        }
+        return response.json();
+    })
+    .then(data => {
+        // Local recorder acknowledged and started recording. Proceed to CodeChef test page.
+        window.location.href = "https://www.codechef.com/skill-test/DEMOTEST2";
+    })
+    .catch(error => {
+        console.error("Proctor communication error:", error);
+        errorMsg.textContent = "Error: Cannot connect to the proctoring recorder. Please ensure the recording app is running.";
+        errorMsg.style.display = "block";
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Submit";
+    });
+});
+</script>
+
+</body>
+</html>

@@ -24,10 +24,12 @@ from client.camera import CameraManager
 from client.config import ClientConfig
 from client.disk_queue import DiskQueue
 from client.media import (
+    AudioStreamCapture,
     FfmpegChunkWriter,
     detect_audio_input,
     detect_h264_encoder,
     find_ffmpeg,
+    mux_pcm_into_chunk,
 )
 
 
@@ -62,14 +64,35 @@ class ChunkRecorder:
         # stream layout (the server's TS concat requires that). If audio is off,
         # there is no working mic, or permission is denied, we record video
         # only — recording is never blocked by audio.
-        self._audio_input = None
+        #
+        # Audio is NOT muxed live into the chunk encoder anymore: on macOS the
+        # rawvideo stdin pipe starved the AVFoundation reader and the mic
+        # DROPPED most frames (chunks had sound only in their first/last
+        # instants). Instead one dedicated ffmpeg captures a continuous PCM
+        # stream for the whole session (lossless — a pipe can't drop), and the
+        # finalizer muxes each chunk's exact slice in as AAC afterwards.
+        self._audio: AudioStreamCapture | None = None
         if config.audio_enabled:
             # detect_audio_input() prints the authoritative [audio] status
             # (which device, measured level, or a silent-mic warning).
-            self._audio_input = detect_audio_input(self._ffmpeg_bin,
-                                                   config.audio_device)
-            if self._audio_input is None:
+            audio_input = detect_audio_input(self._ffmpeg_bin,
+                                             config.audio_device)
+            if audio_input is None:
                 print("[recorder] no usable microphone; recording video only")
+            else:
+                try:
+                    self._audio = AudioStreamCapture(self._ffmpeg_bin,
+                                                     audio_input)
+                except OSError as exc:
+                    print(f"[recorder] could not start audio capture ({exc}); "
+                          "recording video only")
+
+        # Self-heal: if muxing the audio slice into finished chunks keeps
+        # failing, give up on audio and continue publishing video-only chunks.
+        # (When only the MIC dies, AudioStreamCapture itself degrades to
+        # silence and chunks keep their audio track / constant layout.)
+        self._audio_failures = 0
+        self._audio_failure_limit = 2  # ~two chunks (~10 s) before downgrading
 
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="recorder",
@@ -98,6 +121,8 @@ class ChunkRecorder:
         # lost — then let the finalizer thread exit.
         self._finalize_q.put(None)
         self._finalize_thread.join(timeout=timeout)
+        if self._audio is not None:
+            self._audio.close()
 
     @property
     def chunks_recorded(self) -> int:
@@ -127,9 +152,11 @@ class ChunkRecorder:
         part_path = self._queue.staging_path_for(sequence)
         fps = self._config.fps
 
+        # The live encode is now always video-only; the finalizer muxes this
+        # chunk's audio slice in afterwards (see __init__ for why).
         writer = FfmpegChunkWriter(part_path, width, height, fps,
                                    self._ffmpeg_bin, self._encoder,
-                                   self._audio_input)
+                                   audio_input=None)
 
         target_total = int(round(self._config.chunk_seconds * fps))
         start = time.monotonic()
@@ -158,28 +185,58 @@ class ChunkRecorder:
             # for this ffmpeg (and its mic) to flush and close. That wait was
             # the dead time that made playback jump at each chunk boundary.
             self._finalize_q.put(
-                (writer, part_path, final_path, frames_written))
+                (writer, part_path, final_path, frames_written, start))
 
     # --- background finalization --------------------------------------------
     def _finalize_loop(self) -> None:
-        """Flush and publish finished chunks in order, off the capture path."""
+        """Flush, add audio, and publish finished chunks in order.
+
+        Runs off the capture path. Chunks arrive strictly in sequence, so
+        consuming the continuous PCM stream here is naturally ordered: each
+        chunk aligns the stream to its own start time (skipping the few ms
+        lost between chunks) and takes exactly its video duration of audio.
+        """
         while True:
             item = self._finalize_q.get()
             try:
                 if item is None:
                     return
-                writer, part_path, final_path, frames_written = item
+                writer, part_path, final_path, frames_written, start = item
                 try:
                     writer.close()
                 except RuntimeError as exc:
                     print(f"[recorder] chunk encode failed: {exc}")
                     _silently_remove(part_path)
                     continue
-                # Publish to the queue only if the chunk actually has content.
-                if frames_written > 0:
-                    os.replace(part_path, final_path)
-                else:
+                if frames_written <= 0:
                     _silently_remove(part_path)
+                    continue
+                if self._audio is not None:
+                    duration = frames_written / self._config.fps
+                    self._audio.align_to(start)
+                    pcm = self._audio.read_seconds(duration)
+                    mux_path = part_path + ".audio.mp4"  # leading dot kept
+                    try:
+                        mux_pcm_into_chunk(self._ffmpeg_bin, part_path, pcm,
+                                           mux_path)
+                    except RuntimeError as exc:
+                        print(f"[recorder] audio mux failed: {exc}")
+                        _silently_remove(mux_path)
+                        self._audio_failures += 1
+                        if self._audio_failures >= self._audio_failure_limit:
+                            self._audio.close()
+                            self._audio = None
+                            print("[recorder] audio muxing keeps failing; "
+                                  "continuing with VIDEO ONLY for the rest "
+                                  "of this session.")
+                        # Publish the chunk video-only rather than lose it.
+                        os.replace(part_path, final_path)
+                        continue
+                    self._audio_failures = 0
+                    os.replace(mux_path, final_path)  # publish first...
+                    _silently_remove(part_path)       # ...then drop staging
+                else:
+                    os.replace(part_path, final_path)
             finally:
                 self._finalize_q.task_done()
 
